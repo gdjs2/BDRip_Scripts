@@ -69,7 +69,6 @@ def main():
             .global_args("-hide_banner")
         _, err = stream.run(capture_stdout=True, capture_stderr=True)
     except ffmpeg.Error as e:
-        logger.error(f"ffmpeg exited with code: {e.returncode}")
         logger.error(f"ffmpeg stderr:\n{e.stderr.decode('utf-8', errors="ignore")}")
         sys.exit(1)
 
