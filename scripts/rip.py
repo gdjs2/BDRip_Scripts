@@ -9,6 +9,11 @@ from tqdm import tqdm
 from loguru import logger
 from pathlib import Path
 
+ENCODER_CONFIG_PREDEFINED = {
+    "x264": {"name": "x264", "library": "libx264"},
+    "x265": {"name": "x265", "library": "libx265"}
+}
+
 def get_video_duration(file_path: Path) -> float:
     try:
         probe = ffmpeg.probe(str(file_path))
@@ -50,7 +55,7 @@ def run_ffmpeg(stream, description: str, total_duration: float, log_file: Path, 
             total=total_duration, 
             unit="s", 
             desc=short_desc, 
-            ncols=90,
+            ncols=75,
             colour="green",
             bar_format=pbar_format
         ) as pbar:
@@ -105,19 +110,25 @@ def main():
     parser = argparse.ArgumentParser(description="2Pass ripper for video files.")
     parser.add_argument("input_file", type=str, help="Path to the input video file.")
     parser.add_argument("dest_dir", type=str, help="Destination directory for the output files.")
-    parser.add_argument("x264_bitrate", type=int, help="Target bitrate for the output video in x264.")
-    parser.add_argument("x265_bitrate", type=int, help="Target bitrate for the output video in x265.")
-    parser.add_argument("crop_filter", type=str, help="ffmpeg crop filter to apply (e.g., 'crop=1280:720:0:0').")
+    parser.add_argument("--crop_filter", "-c", type=str, help="ffmpeg crop filter to apply (e.g., 'crop=1280:720:0:0').")
+    parser.add_argument("--x264_bitrate", "-4", type=int, help="Target bitrate for the output video in x264.")
+    parser.add_argument("--x265_bitrate", "-5", type=int, help="Target bitrate for the output video in x265.")
     args = parser.parse_args()
 
-    if args.x264_bitrate <= 0 or args.x265_bitrate <= 0:
-        logger.error("Bitrate must be a positive integer.")
+    if args.x264_bitrate is None and args.x265_bitrate is None:
+        logger.error("At least one of --x264_bitrate or --x265_bitrate must be specified.")
+        sys.exit(1)
+    if args.x264_bitrate is not None and args.x264_bitrate <= 0:
+        logger.error("x264_bitrate must be a positive integer.")
+        sys.exit(1)
+    if args.x265_bitrate is not None and args.x265_bitrate <= 0:
+        logger.error("x265_bitrate must be a positive integer.")
         sys.exit(1)
 
     input_file_path = Path(args.input_file)
     dest_dir_path = Path(args.dest_dir)
-    x264_video_bitrate = f"{args.x264_bitrate}k"
-    x265_video_bitrate = f"{args.x265_bitrate}k"
+    x264_video_bitrate = f"{args.x264_bitrate}k" if args.x264_bitrate else None
+    x265_video_bitrate = f"{args.x265_bitrate}k" if args.x265_bitrate else None
     crop_filter = args.crop_filter
 
     # Validations
@@ -146,10 +157,11 @@ def main():
     absolute_dest_dir = dest_dir_path.resolve()
     absolute_logs_dir = logs_dir_path.resolve()
 
-    encoder_config = [
-        {"name": "x264", "library": "libx264"}, 
-        {"name": "x265", "library": "libx265"},
-    ]
+    encoder_config = []
+    if x264_video_bitrate:
+        encoder_config.append(ENCODER_CONFIG_PREDEFINED["x264"])
+    if x265_video_bitrate:
+        encoder_config.append(ENCODER_CONFIG_PREDEFINED["x265"])
 
     logger.success("Validated rip arguments:")
     logger.info(f"\tSource: {absolute_input_path}")
@@ -181,7 +193,6 @@ def main():
             pass1_kwargs = {
                 "map": "0:v:0",
                 "c:v": encoder_lib,
-                "vf": crop_filter,
                 "preset": "veryslow",
                 "b:v": video_bitrate,
                 "pass": 1,
@@ -191,6 +202,8 @@ def main():
                 "dn": None,
                 "format": "null"
             }
+            if crop_filter:
+                pass1_kwargs["vf"] = crop_filter
 
             pass1_stream = (
                 ffmpeg
@@ -210,7 +223,6 @@ def main():
             pass2_kwargs = {
                 "map": "0:v:0",
                 "c:v": encoder_lib,
-                "vf": crop_filter,
                 "preset": "veryslow",
                 "b:v": video_bitrate,
                 "pass": 2,
@@ -219,6 +231,8 @@ def main():
                 "sn": None,
                 "dn": None,
             }
+            if crop_filter:
+                pass2_kwargs["vf"] = crop_filter
 
             pass2_stream = (
                 ffmpeg
