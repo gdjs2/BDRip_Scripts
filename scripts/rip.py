@@ -28,7 +28,7 @@ def parse_time_to_seconds(time_str: str) -> float:
 def run_ffmpeg(stream, description: str, total_duration: float, emit_output: bool = False):
     logger.info(f"[ffmpeg] {description}")
 
-    process = stream.run_async(capture_stdout=True, capture_stderr=True)
+    process = stream.run_async(pipe_stderr=True, pipe_stdout=True)
 
     time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
 
@@ -180,7 +180,7 @@ def main():
                 .global_args("-hide_banner")
             )
 
-            run_ffmpeg(pass2_stream, f"2-pass encode pass 2 ({encoder_lib}, {video_bitrate})", emit_output=True)
+            run_ffmpeg(pass2_stream, f"2-pass encode pass 2 ({encoder_lib}, {video_bitrate})", total_duration, emit_output=True)
 
             encoded_output_paths.append(encoded_output_path)
 
