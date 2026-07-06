@@ -25,7 +25,7 @@ def parse_time_to_seconds(time_str: str) -> float:
     h, m, s = time_str.split(':')
     return int(h) * 3600 + int(m) * 60 + float(s)
 
-def run_ffmpeg(stream, description: str, total_duration: float, emit_output: bool = False):
+def run_ffmpeg(stream, description: str, total_duration: float, log_file: Path, emit_output: bool = False):
     logger.info(f"[ffmpeg] {description}")
 
     process = stream.run_async(pipe_stderr=True, pipe_stdout=True)
@@ -36,31 +36,54 @@ def run_ffmpeg(stream, description: str, total_duration: float, emit_output: boo
     last_lines = []
 
     buffer = bytearray()
-    with tqdm(total=total_duration, unit="s", desc=description.split()[0], bar_format="{l_bar}{bar}| {n:.1f}s/{total:.1f}s [{elapsed}<{remaining}]") as pbar:
-        while True:
-            byte = process.stderr.read(1)
-            if not byte:
-                if process.poll() is not None:
-                    break
-                continue
 
-            if byte in b'\r\n':
-                if not buffer:
+    f_log = log_file.open('a', encoding='utf-8', errors='ignore')
+
+    short_desc = "Pass 1" if "pass 1" in description.lower() else ("Pass 2" if "pass 2" in description.lower() else "Encode")
+
+    try:
+        f_log.write(f"\n{'='*50}\n--- Starting: {description} ---\n{'='*50}\n")
+
+        pbar_format = "{desc} {percentage:3.0f}% ┃{bar}┃ {n:.1f}s / {total:.1f}s [{elapsed} < {remaining}]"
+
+        with tqdm(
+            total=total_duration, 
+            unit="s", 
+            desc=short_desc, 
+            ncols=90,
+            colour="green",
+            bar_format=pbar_format
+        ) as pbar:
+            while True:
+                byte = process.stderr.read(1)
+                if not byte:
+                    if process.poll() is not None:
+                        break
                     continue
-                line_str = buffer.decode('utf-8', errors='ignore').strip()
-                buffer.clear()
-                last_lines.append(line_str)
-                if len(last_lines) > 20:
-                    last_lines.pop(0)
-                match = time_pattern.search(line_str)
-                if match:
-                    current_time = parse_time_to_seconds(match.group(1))
-                    increment = current_time - last_time
-                    if increment > 0:
-                        pbar.update(increment)
-                        last_time = current_time
-            else:
-                buffer.append(byte[0])
+
+                if byte in b'\r\n':
+                    if not buffer:
+                        continue
+                    line_str = buffer.decode('utf-8', errors='ignore').strip()
+                    buffer.clear()
+
+                    f_log.write(line_str + '\n')
+                    f_log.flush()
+
+                    last_lines.append(line_str)
+                    if len(last_lines) > 20:
+                        last_lines.pop(0)
+                    match = time_pattern.search(line_str)
+                    if match:
+                        current_time = parse_time_to_seconds(match.group(1))
+                        increment = current_time - last_time
+                        if increment > 0:
+                            pbar.update(increment)
+                            last_time = current_time
+                else:
+                    buffer.append(byte[0])
+    finally:
+        f_log.close()
     
     process.wait()
     if process.returncode != 0:
@@ -147,6 +170,8 @@ def main():
         pass_log_prefix = absolute_logs_dir / f"{source_basename}.{selected_encoder}.{video_bitrate}.2pass"
         pass_log_prefix_str = pass_log_prefix.as_posix()
 
+        ffmpeg_log_path = absolute_logs_dir / f"{source_basename}.{selected_encoder}.{video_bitrate}.ffmpeg.log"
+
         try:
             pass1_kwargs = {
                 "map": "0:v:0",
@@ -170,7 +195,12 @@ def main():
                 .global_args("-hide_banner")
             )
 
-            run_ffmpeg(pass1_stream, f"2-pass encode pass 1 ({encoder_lib}, {video_bitrate})", total_duration)
+            run_ffmpeg(
+                pass1_stream, 
+                f"2-pass encode pass 1 ({encoder_lib}, {video_bitrate})", 
+                total_duration,
+                ffmpeg_log_path,
+            )
 
             pass2_kwargs = {
                 "map": "0:v:0",
@@ -193,7 +223,13 @@ def main():
                 .global_args("-hide_banner")
             )
 
-            run_ffmpeg(pass2_stream, f"2-pass encode pass 2 ({encoder_lib}, {video_bitrate})", total_duration, emit_output=True)
+            run_ffmpeg(
+                pass2_stream, 
+                f"2-pass encode pass 2 ({encoder_lib}, {video_bitrate})", 
+                total_duration, 
+                ffmpeg_log_path,
+                emit_output=True
+            )
 
             encoded_output_paths.append(encoded_output_path)
 
