@@ -105,17 +105,19 @@ def main():
     parser = argparse.ArgumentParser(description="2Pass ripper for video files.")
     parser.add_argument("input_file", type=str, help="Path to the input video file.")
     parser.add_argument("dest_dir", type=str, help="Destination directory for the output files.")
-    parser.add_argument("bitrate", type=int, help="Target bitrate for the output video.")
+    parser.add_argument("x264_bitrate", type=int, help="Target bitrate for the output video in x264.")
+    parser.add_argument("x265_bitrate", type=int, help="Target bitrate for the output video in x265.")
     parser.add_argument("crop_filter", type=str, help="ffmpeg crop filter to apply (e.g., 'crop=1280:720:0:0').")
     args = parser.parse_args()
 
-    if args.bitrate <= 0:
+    if args.x264_bitrate <= 0 or args.x265_bitrate <= 0:
         logger.error("Bitrate must be a positive integer.")
         sys.exit(1)
 
     input_file_path = Path(args.input_file)
     dest_dir_path = Path(args.dest_dir)
-    video_bitrate = f"{args.bitrate}k" 
+    x264_video_bitrate = f"{args.x264_bitrate}k"
+    x265_video_bitrate = f"{args.x265_bitrate}k"
     crop_filter = args.crop_filter
 
     # Validations
@@ -152,7 +154,8 @@ def main():
     logger.success("Validated rip arguments:")
     logger.info(f"\tSource: {absolute_input_path}")
     logger.info(f"\tDestination: {absolute_dest_dir}")
-    logger.info(f"\tBitrate: {video_bitrate}")
+    logger.info(f"\tBitrate (x264): {x264_video_bitrate}")
+    logger.info(f"\tBitrate (x265): {x265_video_bitrate}")
     logger.info(f"\tCrop Filter: {crop_filter}")
 
     # 2-pass encode
@@ -165,6 +168,8 @@ def main():
     for config in encoder_config:
         selected_encoder = config["name"]
         encoder_lib = config["library"]
+
+        video_bitrate = x264_video_bitrate if selected_encoder == "x264" else x265_video_bitrate
 
         encoded_output_path = absolute_dest_dir / f"{source_basename}.{selected_encoder}.{video_bitrate}.mkv"
         pass_log_prefix = absolute_logs_dir / f"{source_basename}.{selected_encoder}.{video_bitrate}.2pass"
