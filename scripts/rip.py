@@ -27,7 +27,7 @@ def parse_time_to_seconds(time_str: str) -> float:
 
 def run_ffmpeg(stream, description: str, total_duration: float, emit_output: bool = False):
     logger.info(f"[ffmpeg] {description}")
-    
+
     process = stream.run_async(capture_stdout=True, capture_stderr=True)
 
     time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
@@ -120,6 +120,7 @@ def main():
     logger.info(f"\tCrop Filter: {crop_filter}")
 
     # 2-pass encode
+    total_duration = get_video_duration(absolute_input_path)
 
     source_basename = absolute_input_path.stem
     encoded_output_paths = []
@@ -156,7 +157,7 @@ def main():
                 .global_args("-hide_banner")
             )
 
-            run_ffmpeg(pass1_stream, f"2-pass encode pass 1 ({encoder_lib}, {video_bitrate})")
+            run_ffmpeg(pass1_stream, f"2-pass encode pass 1 ({encoder_lib}, {video_bitrate})", total_duration)
 
             pass2_kwargs = {
                 "map": "0:v:0",
