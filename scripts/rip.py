@@ -1,27 +1,67 @@
 import os
+import re
 import sys
 import glob
 import ffmpeg
 import argparse
 
+from tqdm import tqdm
 from loguru import logger
 from pathlib import Path
 
-def run_ffmpeg(stream, description: str, emit_output: bool = False):
-    logger.info(f"[ffmpeg] {description}")
+def get_video_duration(file_path: Path) -> float:
     try:
-        _, err = stream.run(capture_stdout=True, capture_stderr=True)
-        if emit_output and err:
-            logger.info(f"[ffmpeg] Captured output for: {description}")
-            lines = err.decode('utf-8', errors="ignore").splitlines()
-            for line in lines[-10:]:
-                logger.info(f"\t{line.strip()}")
-            logger.success(f"[ffmpeg] Completed: {description}")
+        probe = ffmpeg.probe(str(file_path))
+        duration = float(probe['format']['duration'])
+        return duration
     except ffmpeg.Error as e:
-        logger.error(f"[ffmpeg] Error occurred while running '{description}'.")
-        if e.stderr:
-            logger.error(f"[ffmpeg] stderr:\n{e.stderr.decode('utf-8', errors='ignore')}")
+        logger.error(f"Error probing video file '{file_path}': {e.stderr.decode('utf-8', errors='ignore')}")
         sys.exit(1)
+    except KeyError:
+        logger.error(f"Could not retrieve duration for video file '{file_path}'.")
+        sys.exit(1)
+
+def parse_time_to_seconds(time_str: str) -> float:
+    h, m, s = time_str.split(':')
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+def run_ffmpeg(stream, description: str, total_duration: float, emit_output: bool = False):
+    logger.info(f"[ffmpeg] {description}")
+    
+    process = stream.run_async(capture_stdout=True, capture_stderr=True)
+
+    time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
+
+    last_time = 0
+    last_lines = []
+
+    with tqdm(total=total_duration, unit="s", desc=description.split()[0], bar_format="{l_bar}{bar}| {n_fmt:.1f}s/{total_fmt:.1f}s [{elapsed}<{remaining}]") as pbar:
+        for line in process.strerr:
+            line_str = line.decode('utf-8', errors='ignore').strip()
+            last_lines.append(line_str)
+            if len(last_lines) > 10:
+                last_lines.pop(0)
+            match = time_pattern.search(line_str)
+            if match:
+                current_time = parse_time_to_seconds(match.group(1))
+                increment = current_time - last_time
+                if increment > 0:
+                    pbar.update(increment)
+                    last_time = current_time
+    
+    process.wait()
+    if process.returncode != 0:
+        logger.error(f"[ffmpeg] Process exited with code {process.returncode} for '{description}'.")
+        logger.error("[ffmpeg] Last 10 lines of stderr:")
+        for line in last_lines:
+            logger.error(f"\t{line}")
+        sys.exit(1)
+    else:
+        if emit_output:
+            logger.info(f"[ffmpeg] Captured output for: {description}")
+            for line in last_lines:
+                logger.info(f"\t{line.strip()}")
+        logger.success(f"[ffmpeg] Completed: {description}")
 
 
 def main():
