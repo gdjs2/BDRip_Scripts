@@ -49,13 +49,13 @@ def run_ffmpeg(stream, description: str, total_duration: float, log_file: Path, 
     try:
         f_log.write(f"\n{'='*50}\n--- Starting: {description} ---\n{'='*50}\n")
 
-        pbar_format = "{desc} {percentage:3.0f}% ┃{bar}┃ {n:.1f}s / {total:.1f}s [{elapsed} < {remaining}]"
+        pbar_format = "{desc} {percentage:3.0f}% ┃{bar:40}┃ {n:>6.1f}s / {total:>6.1f}s [{elapsed} < {remaining}]"
 
         with tqdm(
             total=total_duration, 
             unit="s", 
             desc=short_desc, 
-            ncols=75,
+            ncols=90,
             colour="green",
             bar_format=pbar_format,
             smoothing=0.1,
