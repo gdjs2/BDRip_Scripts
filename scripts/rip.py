@@ -57,7 +57,9 @@ def run_ffmpeg(stream, description: str, total_duration: float, log_file: Path, 
             desc=short_desc, 
             ncols=75,
             colour="green",
-            bar_format=pbar_format
+            bar_format=pbar_format,
+            smoothing=0.1,
+            mininterval=0.5
         ) as pbar:
             while True:
                 byte = process.stderr.read(1)
