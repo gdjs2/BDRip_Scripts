@@ -50,7 +50,7 @@ def run_ffmpeg(stream, description: str, total_duration: float, emit_output: boo
                 line_str = buffer.decode('utf-8', errors='ignore').strip()
                 buffer.clear()
                 last_lines.append(line_str)
-                if len(last_lines) > 10:
+                if len(last_lines) > 20:
                     last_lines.pop(0)
                 match = time_pattern.search(line_str)
                 if match:
@@ -65,7 +65,7 @@ def run_ffmpeg(stream, description: str, total_duration: float, emit_output: boo
     process.wait()
     if process.returncode != 0:
         logger.error(f"[ffmpeg] Process exited with code {process.returncode} for '{description}'.")
-        logger.error("[ffmpeg] Last 10 lines of stderr:")
+        logger.error("[ffmpeg] Last 20 lines of stderr:")
         for line in last_lines:
             logger.error(f"\t{line}")
         sys.exit(1)
