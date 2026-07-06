@@ -35,19 +35,32 @@ def run_ffmpeg(stream, description: str, total_duration: float, emit_output: boo
     last_time = 0
     last_lines = []
 
-    with tqdm(total=total_duration, unit="s", desc=description.split()[0], bar_format="{l_bar}{bar}| {n_fmt:.1f}s/{total_fmt:.1f}s [{elapsed}<{remaining}]") as pbar:
-        for line in process.strerr:
-            line_str = line.decode('utf-8', errors='ignore').strip()
-            last_lines.append(line_str)
-            if len(last_lines) > 10:
-                last_lines.pop(0)
-            match = time_pattern.search(line_str)
-            if match:
-                current_time = parse_time_to_seconds(match.group(1))
-                increment = current_time - last_time
-                if increment > 0:
-                    pbar.update(increment)
-                    last_time = current_time
+    buffer = bytearray()
+    with tqdm(total=total_duration, unit="s", desc=description.split()[0], bar_format="{l_bar}{bar}| {n:.1f}s/{total:.1f}s [{elapsed}<{remaining}]") as pbar:
+        while True:
+            byte = process.stderr.read(1)
+            if not byte:
+                if process.poll() is not None:
+                    break
+                continue
+
+            if byte in b'\r\n':
+                if not buffer:
+                    continue
+                line_str = buffer.decode('utf-8', errors='ignore').strip()
+                buffer.clear()
+                last_lines.append(line_str)
+                if len(last_lines) > 10:
+                    last_lines.pop(0)
+                match = time_pattern.search(line_str)
+                if match:
+                    current_time = parse_time_to_seconds(match.group(1))
+                    increment = current_time - last_time
+                    if increment > 0:
+                        pbar.update(increment)
+                        last_time = current_time
+            else:
+                buffer.append(byte[0])
     
     process.wait()
     if process.returncode != 0:
