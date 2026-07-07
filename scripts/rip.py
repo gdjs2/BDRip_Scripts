@@ -212,7 +212,7 @@ def main():
                 .input(str(absolute_input_path))
                 .output(null_dev, **pass1_kwargs)
                 .overwrite_output()
-                .global_args("-hide_banner")
+                .global_args("-hide_banner", "-nostdin")
             )
 
             run_ffmpeg(
@@ -241,7 +241,7 @@ def main():
                 .input(str(absolute_input_path))
                 .output(str(encoded_output_path), **pass2_kwargs)
                 .overwrite_output()
-                .global_args("-hide_banner")
+                .global_args("-hide_banner", "-nostdin")
             )
 
             run_ffmpeg(
