@@ -1,0 +1,136 @@
+[quote][pre][size=5][color=#9400D3]Ripped For Self-Usage by gdjs2. 
+Only Published@[b]TTG[/b]
+Source from [url]https://totheglory.im/t/807913/[/url][/color][/size][/pre][/quote]
+
+[img]https://free.picui.cn/free/2026/07/09/6a4fc3a447362.jpg[/img]
+
+[pre][size=4][color=red]Comparison Screenshots:[/color][/size][/pre]
+[url=https://free.picui.cn/free/2026/07/09/6a4fc129591d1.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc0227253.png[/img][/url] [url=https://free.picui.cn/free/2026/07/09/6a4fc1295857e.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc02309c1.png[/img][/url]
+[url=https://free.picui.cn/free/2026/07/09/6a4fc1296bc39.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc02a5d8f.png[/img][/url] [url=https://free.picui.cn/free/2026/07/09/6a4fc12958cba.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc0476dce.png[/img][/url]
+[url=https://free.picui.cn/free/2026/07/09/6a4fc12958593.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc04b2292.png[/img][/url] [url=https://free.picui.cn/free/2026/07/09/6a4fc12ca938b.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc04b4fec.png[/img]
+[/url][url=https://free.picui.cn/free/2026/07/09/6a4fc12ccf383.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbffdbc3c.png[/img] [/url][url=https://free.picui.cn/free/2026/07/09/6a4fc12ccc631.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbffdfb21.png[/img][/url]
+[url=https://free.picui.cn/free/2026/07/09/6a4fc12cdc104.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbffe4e40.png[/img][/url] [url=https://free.picui.cn/free/2026/07/09/6a4fc12ce9652.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc001a82f.png[/img][/url]
+[url=https://free.picui.cn/free/2026/07/09/6a4fc12fa6e30.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc01be5b5.png[/img][/url] [url=https://free.picui.cn/free/2026/07/09/6a4fc12fe640b.png][img]https://free.picui.cn/free/2026/07/10/6a4fdc02169e6.png[/img][/url]
+
+
+[pre][size=4][color=red]More Screenshots:[/color][/size][/pre]
+[url=https://free.picui.cn/free/2026/07/10/6a4fcd6901a94.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbfcc9719.png[/img][/url] [url=https://free.picui.cn/free/2026/07/10/6a4fcd68dcffd.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbfd06caa.png[/img][/url]
+[url=https://free.picui.cn/free/2026/07/10/6a4fcd690bb66.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbfd0fc5d.png[/img][/url] [url=https://free.picui.cn/free/2026/07/10/6a4fcd68b5345.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbfce70ba.png[/img][/url]
+[url=https://free.picui.cn/free/2026/07/10/6a4fcd6908758.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbffb0414.png[/img][/url] [url=https://free.picui.cn/free/2026/07/10/6a4fcd6ca3be6.png][img]https://free.picui.cn/free/2026/07/10/6a4fdbfccb75b.png[/img][/url]
+
+[size=5][pre][color=#FF2C2C]Zootopia.2.2025.1080p.BluRay.x264.DTS-HD.MA.7.1-gdjs2[/color][/pre][/size]
+
+[quote]
+[u][b]RELEASE INFO[/b][/u]:
+[pre]
+ENCODER...................: GDJS2
+RELEASE DATE..............: 07/10/2026
+RELEASE SiZE..............: 14.6 GB
+SOURCE....................: 1080p Blu-ray AVC DTS-HD MA.7.1-DIY@TTG
+[/pre]
+[u][b]MEDIA INFO[/b][/u]:
+[pre]
+RUNTiME...................: 1h:47m
+VIDEO CODEC...............: V_MPEG4/ISO/AVC @ 12.8 Mb/s 
+RESOLUTION................: 1920x804 (2.39:1)  
+FRAME RATE................: 23.976 fps
+AUDiO CODEC...............: English DTS-HD Master Audio 7.1ch @ 4 765 kb/s
+                            English DTS 5.1ch @ 1 509 kb/s
+                            English Dolby Digital 2.0ch @ 320 kb/s
+SUBTiTLES.................: S_TEXT/UTF8 (zh&en)
+[/pre]
+[u][b]x264 INFO[/b][/u]:
+[pre]
+[libx264 @ 0000023a73380c00] profile High, level 5.0, 4:2:0, 8-bit
+[libx264 @ 0000023a73380c00] frame I:1397  Avg QP:10.46  size:384516
+[libx264 @ 0000023a73380c00] frame P:43761 Avg QP:13.11  size:120129
+[libx264 @ 0000023a73380c00] frame B:109858 Avg QP:14.65  size: 41421
+[libx264 @ 0000023a73380c00] consecutive B-frames:  5.7%  6.3% 20.3% 21.8% 17.2% 24.3%  3.1%  0.8%  0.5%
+[libx264 @ 0000023a73380c00] Weighted P-Frames: Y:3.2% UV:2.5%
+[libx264 @ 0000023a73380c00] kb/s:12799.72
+[/pre]
+[/quote]
+
+[pre][size=4][color=red]Description from the Source:[/color][/size][/pre]
+[quote]
+◎译　　名　疯狂动物城2 / Zootopia 2: Rise of the Non-Mammalians/Zootropolis 2/优兽大都会2(港)/动物乌托邦2/动物方城市2(台)
+◎片　　名　Zootopia 2
+◎年　　代　2025
+◎产　　地　美国
+◎类　　别　喜剧 / 动画 / 悬疑 / 犯罪 / 冒险
+◎语　　言　英语
+◎上映日期　2025-11-26(美国/中国大陆)
+◎IMDb链接  https://www.imdb.com/title/tt26443597/
+◎IMDb评分  7.4/10 from 120127 users
+◎豆瓣评分　8.3/10 from 754324 users
+◎豆瓣链接　https://movie.douban.com/subject/26817136/
+◎片　　长　108分钟
+◎导　　演　杰拉德·布什 / 拜伦·霍华德
+◎编　　剧　杰拉德·布什
+◎主　　演　金妮弗·古德温
+　　　　　　杰森·贝特曼
+　　　　　　关继威
+　　　　　　福琼·费姆斯特
+　　　　　　安迪·萨姆伯格
+　　　　　　大卫·斯特雷泽恩
+　　　　　　夏奇拉
+　　　　　　伊德瑞斯·艾尔巴
+　　　　　　帕特里克·沃伯顿
+　　　　　　昆塔·布伦森
+　　　　　　丹尼·特雷霍
+　　　　　　艾伦·图代克
+　　　　　　内特·托伦斯
+　　　　　　唐·雷克
+　　　　　　邦妮·亨特
+　　　　　　珍妮·斯蕾特
+　　　　　　麦考利·卡尔金
+　　　　　　布兰达·宋
+　　　　　　莫里斯·拉马奇
+　　　　　　莉亚·莱瑟姆
+　　　　　　雷蒙德·S·佩尔西
+　　　　　　马克·史密斯
+　　　　　　汤米·利斯特
+　　　　　　让·雷诺
+　　　　　　塞西莉·斯特朗
+　　　　　　朱恩·斯奎布
+　　　　　　米歇尔·戈麦兹
+　　　　　　戴维·法恩
+　　　　　　约翰·雷吉扎莫
+　　　　　　汤米·钟
+　　　　　　罗伯特·欧文
+　　　　　　道恩·强森
+　　　　　　奥丽伊·卡瓦洛
+　　　　　　艾德·希兰
+　　　　　　乔什·加德
+　　　　　　斯蒂芬妮·比翠丝
+　　　　　　迈克尔·J·福克斯
+　　　　　　乔希·达拉斯
+　　　　　　彼得·曼斯布里奇
+　　　　　　伊薇特·尼科尔·布朗
+　　　　　　布莱克·斯拉特金
+　　　　　　维尔摩·瓦尔德拉玛
+　　　　　　瑞切尔·豪斯
+　　　　　　阿尼卡·诺尼·罗斯
+　　　　　　拜伦·霍华德
+　　　　　　杰拉德·布什
+　　　　　　大卫·万蒂勒
+
+◎简　　介
+
+　　　　一个神秘爬行动物的到来，把温馨的动物城搅动得天翻地覆。面对全新的城市危机，警官兔朱迪（金妮弗·古德温 Ginnifer Goodwin 配音）与狐尼克（杰森·贝特曼 Jason Bateman 配音）将继续携手为保卫动物城而奔波。在追捕行动中，这对老搭档不仅要揭开新角色的神秘面纱，还要前往被迷雾笼罩的新领域，探索未知的地下黑市，一场疯狂动物城的全新冒险即将展开……
+◎获奖情况
+
+　　第98届奥斯卡金像奖  (2026)
+　　最佳动画长片(提名)
+　　
+　　第83届金球奖  (2026)
+　　电影类最佳动画长片(提名)
+　　电影类电影和票房成就奖(提名)
+　　
+　　第79届英国电影学院奖  (2026)
+　　电影奖最佳动画片
+　　电影奖最佳儿童/家庭片(提名)
+　　
+　　第31届美国评论家选择电影奖  (2026)
+　　最佳动画片(提名)
+[/quote]

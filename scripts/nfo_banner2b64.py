@@ -13,8 +13,8 @@ if __name__ == '__main__':
     try:
         with open(input_file, 'rb') as f:
             content = f.read()
-        top_boundary = b"Ne.Zha.2019.2160p.BluRay.DoVi.x265.10bit.Atmos.TrueHD7.1-WiKi\r\n"
-        bottom_boundary = b"TTG \r\n"
+        top_boundary = b"Zootopia 2\r\n"
+        bottom_boundary = b"SOURCE...............: NULL\r\n"
         top_split = content.split(top_boundary)
         if len(top_split) > 1:
             top_banner = top_split[0]
