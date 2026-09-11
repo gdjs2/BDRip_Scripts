@@ -13,7 +13,6 @@ import time
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable
 
 from rich.console import Console
 from rich.table import Table
@@ -23,11 +22,13 @@ if __package__:
     from .crf_crop import detect_crop
     from .crf_encode import check_encoder, validate_source_settings
     from .crf_runtime import BudgetExpired, run_probe, run_process
+    from .crf_optimizer import auto_search, measured_summary, next_trial
 else:
     from crf_config import load_config, parse_time, validate_config
     from crf_crop import detect_crop
     from crf_encode import check_encoder, validate_source_settings
     from crf_runtime import BudgetExpired, run_probe, run_process
+    from crf_optimizer import auto_search, measured_summary, next_trial
 
 
 SCHEMA_VERSION = 1
@@ -136,95 +137,6 @@ def summarize_trial(crf: float, results: list[dict], policy: dict) -> dict:
     }
 
 
-def auto_search(evaluate: Callable[[float], dict], policy: dict, search: dict) -> tuple[list[dict], dict]:
-    """Bracket a passing CRF and refine it; interpolate only to choose real trials."""
-    low, high = search["min_crf"], search["max_crf"]
-    precision, budget = search["precision"], search["max_trials"]
-    measured: dict[float, dict] = {}
-
-    def snap(value: float) -> float:
-        if value <= low:
-            return low
-        if value >= high:
-            return high
-        candidate = low + round((value - low) / precision) * precision
-        if candidate <= low:
-            return low
-        if candidate >= high:
-            return high
-        return round(candidate, 8)
-
-    def trial(value: float) -> None:
-        value = snap(value)
-        if value not in measured and len(measured) < budget:
-            measured[value] = evaluate(value)
-
-    initial = snap(policy["initial_crf"])
-    trial(initial)
-    # Neighbors expose a local slope; subsequent trials expand or narrow the bracket.
-    step = max(precision, 1.0)
-    for candidate in (initial - step, initial + step):
-        trial(candidate)
-
-    reason = "trial_limit"
-    while True:
-        ordered = sorted(measured)
-        passes = [c for c in ordered if measured[c]["qp_pass"]]
-        fails = [c for c in ordered if not measured[c]["qp_pass"]]
-        # A failed point below a passing one contradicts the search assumption.
-        if any(f < p for f in fails for p in passes):
-            reason = "nonmonotonic_observations"
-            break
-        if passes and max(passes) >= high - 1e-8:
-            reason = "upper_bound_passes"
-            break
-        if not passes and min(ordered) <= low + 1e-8:
-            reason = "no_passing_crf_in_bounds"
-            break
-        if passes and fails and min(fails) - max(passes) <= precision + 1e-8:
-            reason = "precision_reached"
-            break
-        if len(measured) >= budget:
-            reason = "trial_limit"
-            break
-        if not passes:
-            candidate = snap(max(low, min(ordered) - step))
-            step *= 2
-        elif not fails:
-            candidate = snap(min(high, max(ordered) + step))
-            step *= 2
-        else:
-            left, right = max(passes), min(fails)
-            # Secant interpolation of QP, clamped away from either endpoint.
-            def gate(row: dict) -> float:
-                return max(row["qp95"], row.get("stress_qp") or row["qp95"])
-            qleft, qright = gate(measured[left]), gate(measured[right])
-            ratio = ((policy["qp_target"] - qleft) / (qright - qleft)
-                     if qright > qleft else 0.5)
-            ratio = min(0.75, max(0.25, ratio))
-            candidate = snap(left + (right - left) * ratio)
-            if candidate in measured:
-                candidate = snap((left + right) / 2)
-        if candidate in measured:
-            reason = "precision_reached"
-            break
-        before = len(measured)
-        trial(candidate)
-        if len(measured) == before:
-            reason = "precision_reached"
-            break
-    rows = [measured[c] for c in sorted(measured)]
-    passing = [r for r in rows if r["qp_pass"]]
-    return rows, {
-        "reason": reason,
-        "trials": len(rows),
-        "recommended_crf": max((r["crf"] for r in passing), default=None),
-        "verified": bool(passing),
-        "precision": precision,
-        "bounds": [low, high],
-    }
-
-
 def fit_relationship(rows: list[dict]) -> dict | None:
     """Describe a local log-linear bitrate fit, never presented as measurements."""
     if len(rows) < 3:
@@ -244,29 +156,6 @@ def fit_relationship(rows: list[dict]) -> dict | None:
             "r_squared_log_space": 1 - residual / total if total else None,
             "valid_crf_interval": [min(xs), max(xs)],
             "note": "Descriptive sample fit; predictions are not verified measurements."}
-
-
-def next_trial(rows: list[dict], policy: dict, search: dict) -> tuple[float | None, dict | None]:
-    """Advance deterministic search using completed observations, without encoding.
-
-    Replaying at most a handful of observations lets the caller alternate codecs
-    between trials while retaining the same search and stopping criteria.
-    """
-    class TrialNeeded(Exception):
-        pass
-
-    measured = {row["crf"]: row for row in rows}
-
-    def evaluate(crf: float) -> dict:
-        if crf not in measured:
-            raise TrialNeeded(crf)
-        return measured[crf]
-
-    try:
-        _, summary = auto_search(evaluate, policy, search)
-    except TrialNeeded as exc:
-        return exc.args[0], None
-    return None, summary
 
 
 def sample_floor(info: dict, config: dict, codecs: list[str]) -> float:
@@ -311,15 +200,48 @@ def show_settings(config: dict, codecs: list[str], crfs: list[float] | None) -> 
     CONSOLE.print("CRFs: " + (", ".join(f"{crf:g}" for crf in crfs) if crfs else
                   f"automatic {search['min_crf']:g}–{search['max_crf']:g}, "
                   f"at most {search['max_trials']} trials per codec"))
+    if crfs is None:
+        CONSOLE.print("Automatic selection: find the highest CRF meeting the QP target; "
+                      "each measurement chooses the next CRF. Prioritize up to three "
+                      "comparison trials per codec within the hard time budget.")
     runtime = config["runtime"]
     CONSOLE.print(f"Time budget for the whole run: target {runtime['target_seconds']:g}s, "
                   f"maximum {runtime['max_seconds']:g}s (including crop and calibration).")
 
 
-def measured_summary(rows: list[dict], reason: str) -> dict:
-    passing = [row["crf"] for row in rows if row["qp_pass"]]
-    return {"reason": reason, "trials": len(rows),
-            "recommended_crf": max(passing, default=None), "verified": bool(passing)}
+def explain_trial(crf: float, rows: list[dict], policy: dict) -> str:
+    """Describe the observation that led to the next real encode."""
+    if not rows:
+        return "measure the initial CRF"
+    passing = [row for row in rows if row["qp_pass"]]
+    failing = [row for row in rows if not row["qp_pass"]]
+    if passing and failing:
+        return (f"refine the boundary between passing CRF {max(row['crf'] for row in passing):g} "
+                f"and failing CRF {min(row['crf'] for row in failing):g}")
+    previous = min(rows, key=lambda row: abs(row["crf"] - crf))
+    gate = max(previous["qp95"], previous.get("stress_qp")
+               if previous.get("stress_qp") is not None else previous["qp95"])
+    direction = "increase" if crf > previous["crf"] else "decrease"
+    return (f"{direction} CRF after measured QP {gate:.3f} at CRF {previous['crf']:g} "
+            f"({'passes' if previous['qp_pass'] else 'exceeds'} target {policy['qp_target']:g})")
+
+
+def sampling_identity(signature: dict) -> dict | None:
+    """Keep calibrated plans when only search policy changes, including old reports.
+
+    Trial limits and QP targets do not change the encoded samples. Earlier
+    reports stored the full config here; normalize both forms so an optimizer
+    update can reuse measurements made before that update.
+    """
+    try:
+        config = signature["config"]
+        return {**signature, "config": {
+            "video": config["video"], "sampling": config["sampling"], "runtime": config["runtime"],
+            "codecs": {codec: {key: config["codecs"][codec][key] for key in ENCODER_KEYS}
+                       for codec in signature["codecs"]},
+        }}
+    except (KeyError, TypeError):
+        return None
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -388,14 +310,21 @@ def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume:
 def write_reports(output: Path, report: dict) -> None:
     write_json(output / "results.json", report)
     fields = ["codec", "crf", "bitrate_mbps", "qp95", "worst_qp", "stress_qp", "qp_pass",
-              "recommended", "status", "measurement"]
+              "recommended", "status", "measurement", "best_tested", "search_outcome",
+              "search_converged", "recommendation_status"]
     with (output / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for codec, analysis in report["codecs"].items():
-            best = analysis.get("search", {}).get("recommended_crf")
+            summary = analysis.get("search", {})
+            recommended = summary.get("recommended_crf")
+            best = summary.get("best_tested_crf")
             for row in analysis["rows"]:
-                writer.writerow({**row, "codec": codec, "recommended": row["crf"] == best})
+                writer.writerow({**row, "codec": codec, "recommended": row["crf"] == recommended,
+                                 "best_tested": row["crf"] == best,
+                                 "search_outcome": summary.get("reason", "running"),
+                                 "search_converged": summary.get("converged", False),
+                                 "recommendation_status": summary.get("recommendation_status", "running")})
 
 
 def show_table(codec: str, rows: list[dict], summary: dict) -> None:
@@ -404,15 +333,25 @@ def show_table(codec: str, rows: list[dict], summary: dict) -> None:
         table.add_column(name, justify="left" if name == "Status" else "right")
     for row in rows:
         best = row["crf"] == summary["recommended_crf"]
+        provisional = not best and row["crf"] == summary.get("best_tested_crf")
         table.add_row(f"{row['crf']:g}", f"{row['bitrate_mbps']:.3f}", f"{row['qp95']:.2f}",
                       f"{row['worst_qp']:.2f}",
                       "—" if row["stress_qp"] is None else f"{row['stress_qp']:.2f}",
-                      ("BEST: " if best else "") + row["status"], style="green" if best else "")
+                      ("RECOMMENDED: " if best else "CANDIDATE: " if provisional else "") + row["status"],
+                      style="green" if best else "")
     CONSOLE.print(table)
-    if summary["recommended_crf"] is None:
-        CONSOLE.print("No tested CRF satisfied the QP safety target.")
+    if summary["recommended_crf"] is not None:
+        row = next(row for row in rows if row["crf"] == summary["recommended_crf"])
+        CONSOLE.print(f"Recommended {codec} CRF: {row['crf']:g} — "
+                      f"{row['bitrate_mbps']:.3f} Mbps, QP95 {row['qp95']:.3f}. "
+                      "Confirmed by measured CRF comparisons within the configured bounds.")
+    elif summary.get("best_tested_crf") is not None:
+        CONSOLE.print(f"Best tested passing CRF: {summary['best_tested_crf']:g} "
+                      "(provisional; no converged automatic recommendation).")
     else:
-        CONSOLE.print(f"Highest tested passing CRF: {summary['recommended_crf']:g}")
+        CONSOLE.print("No tested CRF satisfied the QP safety target.")
+    if len(rows) < 2:
+        CONSOLE.print(f"Only {len(rows)} CRF value(s) measured; insufficient comparisons to select a best CRF.")
     CONSOLE.print(f"Search outcome: {summary['reason']}")
 
 
@@ -529,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
                             "Movie bitrate is estimated from representative samples; stress samples are excluded.",
                             "QP95 is the interpolated 95th percentile of sample max(I/P/B average QP).",
                             "Each stress sample must also meet the QP safety target.",
+                            "Automatic recommendations require a measured passing/failing boundary or a passing upper bound, with at least two distinct CRFs compared.",
                             "QP is an encoder policy metric, not a guarantee of visual transparency.",
                             "Short clips give preliminary estimates; GOP startup and limited scene coverage affect results."]}
         write_reports(output, report)
@@ -567,10 +507,11 @@ def main(argv: list[str] | None = None) -> int:
         signature = {"source": source_id, "versions": versions, "config": config,
                      "codecs": codecs, "crop": crop_detection["crop"],
                      "backend_sha256": hashlib.sha256(Path(__file__).with_name("crf_encode.py").read_bytes()).hexdigest()}
+        signature = sampling_identity(signature)
         saved_plan = (previous_report.get("sampling_calibration", {})
                       if isinstance(previous_report, dict) else {})
         saved_length = saved_plan.get("seconds")
-        if (saved_plan.get("signature") == signature
+        if (sampling_identity(saved_plan.get("signature")) == signature
                 and isinstance(saved_length, (int, float)) and minimum <= saved_length <= maximum):
             length = saved_length
             timings = saved_plan.get("timings", {})
@@ -590,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
                     timings[codec] = {"duration": pilot["duration"],
                                       "wall_seconds": pilot.get("wall_seconds", timeout)}
                 except BudgetExpired:
-                    report["codecs"][codec]["search"] = measured_summary([], "time_limit")
+                    report["codecs"][codec]["search"] = measured_summary([], "time_limit", config["search"])
                     active.remove(codec)
                     CONSOLE.print(f"{codec}: timing pilot exceeded its budget; no complete trial measured.")
             if timings:
@@ -639,12 +580,20 @@ def main(argv: list[str] | None = None) -> int:
                     retire(codec)
                     continue
                 estimated = trial_times.get(codec, 0.0)
+                priority_comparison = crfs is None and len(rows) < min(3, config["search"]["max_trials"])
                 if (remaining() <= 0 or quota[codec] <= 0
-                        or (rows and time.monotonic() >= target)
-                        or (rows and estimated > target - time.monotonic())):
-                    analysis["search"] = measured_summary(rows, "time_limit")
+                        or (rows and not priority_comparison and time.monotonic() >= target)
+                        or (rows and not priority_comparison and estimated > target - time.monotonic())):
+                    analysis["search"] = measured_summary(rows, "time_limit", config["search"])
                     retire(codec)
                     continue
+                decision = explain_trial(candidate, rows, policy) if crfs is None else "measure the requested sweep value"
+                CONSOLE.print(f"{codec}: testing CRF {candidate:g} — {decision}.")
+                if priority_comparison:
+                    CONSOLE.print(f"Comparison {len(rows) + 1}/3 has priority over the soft time target; "
+                                  f"{min(remaining(), quota[codec]):.0f}s available in the hard budget.")
+                entry = {"crf": candidate, "reason": decision, "completed": False}
+                analysis.setdefault("decisions", []).append(entry)
                 trial_started = time.monotonic()
                 results = []
                 timed_out = False
@@ -658,15 +607,16 @@ def main(argv: list[str] | None = None) -> int:
                                                 output, not args.no_resume, timeout=timeout)
                             results.append({**result, "sample": sample})
                 except BudgetExpired:
-                    analysis["search"] = measured_summary(rows, "time_limit")
+                    analysis["search"] = measured_summary(rows, "time_limit", config["search"])
                     analysis["incomplete_trial"] = {"crf": candidate, "completed_samples": len(results),
                                                     "required_samples": len(samples)}
                     timed_out = True
                 else:
                     row = summarize_trial(candidate, results, policy)
+                    entry["completed"] = True
                     rows.append(row)
                     rows.sort(key=lambda item: item["crf"])
-                    analysis["search"] = measured_summary(rows, "running")
+                    analysis["search"] = measured_summary(rows, "running", config["search"])
                     CONSOLE.print(f"{codec} CRF {candidate:g}: {row['bitrate_mbps']:.3f} Mbps, "
                                   f"QP95 {row['qp95']:.2f} — {row['status']}")
                 elapsed = time.monotonic() - trial_started
@@ -676,12 +626,13 @@ def main(argv: list[str] | None = None) -> int:
                 trial_times[codec] = elapsed * 1.25
                 report["runtime"]["elapsed_seconds"] = time.monotonic() - started
                 write_reports(output, report)
-        report["state"] = "complete"
         for codec, analysis in report["codecs"].items():
             analysis["relationship_fit"] = fit_relationship(analysis["rows"])
-            if analysis["search"]["reason"] == "time_limit":
-                report["state"] = "time_limit"
             show_table(codec, analysis["rows"], analysis["search"])
+        summaries = [analysis["search"] for analysis in report["codecs"].values()]
+        report["state"] = ("time_limit" if any(summary["reason"] == "time_limit" for summary in summaries)
+                           else "incomplete" if crfs is None and any(not summary["converged"] for summary in summaries)
+                           else "complete")
         report["runtime"]["elapsed_seconds"] = time.monotonic() - started
         write_reports(output, report)
         CONSOLE.print(f"Finished in {report['runtime']['elapsed_seconds']:.1f}s; {report['state']}.")
@@ -692,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
             report["state"] = "time_limit"
             report["runtime"]["elapsed_seconds"] = time.monotonic() - started
             for codec, analysis in report["codecs"].items():
-                analysis["search"] = measured_summary(analysis["rows"], "time_limit")
+                analysis["search"] = measured_summary(analysis["rows"], "time_limit", config["search"])
                 analysis["relationship_fit"] = fit_relationship(analysis["rows"])
                 show_table(codec, analysis["rows"], analysis["search"])
             write_reports(output, report)

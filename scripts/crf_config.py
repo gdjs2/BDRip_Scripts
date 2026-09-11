@@ -41,7 +41,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_crf": 14.0,
         "max_crf": 23.0,
         "precision": 0.1,
-        "max_trials": 6,
+        "max_trials": 12,
     },
     "codecs": {
         "x264": {

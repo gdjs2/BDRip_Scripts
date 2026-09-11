@@ -48,7 +48,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["runtime"], {"target_seconds": 180.0, "max_seconds": 300.0})
         self.assertEqual(config["sampling"]["count"], 10)
         self.assertEqual(config["sampling"]["seconds"], 6.0)
-        self.assertEqual(config["search"]["max_trials"], 6)
+        self.assertEqual(config["search"]["max_trials"], 12)
         config = validate_config({"runtime": {"target_seconds": 120}})
         self.assertEqual(config["runtime"], {"target_seconds": 120.0, "max_seconds": 300.0})
         self.assertIsInstance(config["runtime"]["target_seconds"], float)
@@ -56,6 +56,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(load_config()["runtime"]["max_seconds"], 300.0)
         self.assertEqual(validate_config({"runtime": {"target_seconds": 300}})["runtime"],
                          {"target_seconds": 300.0, "max_seconds": 300.0})
+        for cap in (3, 6, 20):
+            with self.subTest(max_trials=cap):
+                self.assertEqual(validate_config({"search": {"max_trials": cap}})["search"]["max_trials"], cap)
 
     def test_runtime_requires_positive_finite_consistent_budgets(self):
         for field in ("target_seconds", "max_seconds"):

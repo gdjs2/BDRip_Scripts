@@ -177,13 +177,19 @@ settings, then run:
 uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json
 ```
 
+This command searches automatically; no `--crf-values` argument is needed.
+After each measured trial, it raises CRF if QP passes or lowers CRF if QP
+fails, then refines the passing/failing boundary. Progress explains the next
+CRF choice. A completed search reports the recommended CRF with measured
+sample bitrate and QP. A lone passing trial is labelled provisional.
+
 The example includes the supplied x264/x265 argument strings. Defaults are
 x264 High@4.1 with `placebo`, and x265 Main10 with automatic level and `slower`.
 The selected preset, profile, level, pixel format, tune, encoder parameters,
 and additional codec options are printed before encoding starts.
 Every CRF trial uses the same configured preset, tune, crop, and encoder
 arguments. To request a measured table at specific CRFs instead of
-automatically searching for the highest tested passing CRF:
+running the automatic search:
 
 ```powershell
 uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec x265 --crf-values 16,17,18,19,20,21,22
@@ -194,13 +200,17 @@ The default runtime target is three minutes, with a five-minute maximum for
 the whole analysis, including source inspection, cropping, and calibration.
 When needed, calibration measures encoding speed and chooses a common sample duration of
 up to six seconds for ten evenly distributed windows. That duration stays
-fixed across both codecs and all CRFs. Automatic search tests at most six CRFs
-per codec, subject to the shared runtime budget. Complete trials alternate
-between codecs; each gets a reserved share to attempt its first trial even
-after the soft target, which gates additional trials. Unused time from a
+fixed across both codecs and all CRFs. Automatic search tests at most twelve
+CRFs per codec, subject to the shared runtime budget. The larger trial cap
+allows refinement when QP changes nonlinearly; the runtime guard controls
+duration. Complete trials alternate
+between codecs; each gets a reserved share to attempt up to three priority
+comparison trials even after the soft target, which gates further trials.
+Unused time from a
 finished codec is shared with the others. Short samples provide
 preliminary estimates; slow encoders may reach the limit before completing a
-table row. Completed rows are retained with a `time_limit` outcome, and the
+table row or refining a recommendation. Completed rows are retained with a
+`time_limit` outcome, and the
 maximum deadline stops any active worker. Use `--target-seconds` and
 `--max-seconds` to override the budget; `--max-seconds` alone also lowers the
 existing target if necessary. `--sample-seconds` sets the sample duration upper
@@ -228,12 +238,21 @@ full frame automatically.
 
 The console table and `<movie-stem>.crf-search/summary.csv` show CRF, measured
 sample video Mbps, QP95, worst representative QP, stress QP, and status.
+The best tested passing CRF is reported separately from a recommendation.
+Recommendations require at least two distinct measurements and either
+refinement to the configured precision or a passing upper search bound.
+Explicit sweeps report the best tested value without claiming an optimized
+recommendation.
+The console labels an unconverged passing result `Best tested passing CRF
+(provisional)`. Automatic searches stopped by a trial limit or nonmonotonic
+measurements record an `incomplete` state; runtime limits record `time_limit`.
 `results.json` records settings, resolved crop detection, sample measurements,
 the recommendation, and a descriptive bitrate fit when at least three CRFs
 were measured. Video Mbps
 excludes audio and container overhead; it estimates full-movie video bitrate
 from the chosen samples. Completed samples and encoder logs are saved alongside
-the reports, and rerunning the same command reuses matching completed samples.
+the reports. Rerunning the original command reuses its matching sample plan
+and completed encodes, including prior initial-CRF measurements.
 Use `--output-dir` to choose another report directory or `--no-resume` to encode
 again. QP thresholds guide selection but do not guarantee visual transparency.
 

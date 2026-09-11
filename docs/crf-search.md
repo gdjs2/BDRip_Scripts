@@ -573,6 +573,8 @@ uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json
 ```
 
 Both codecs run by default. Use `--codec x264` or `--codec x265` to select one.
+The command automatically selects and measures successive CRFs; no
+`--crf-values` or `--crf-range` argument is needed for optimization.
 Omitting `--config` uses the same defaults as the example. This is a standalone
 analyzer; it does not change the existing HandBrake release pipeline.
 The default runtime target is 180 seconds, with a maximum of 300 seconds for
@@ -649,8 +651,8 @@ to the capabilities of the installed libraries.
 | `sampling.stress_starts` | `[]`; extra known difficult scenes, each using the configured sample duration or remaining video duration. |
 | `search.min_crf` / `search.max_crf` | `14.0` / `23.0`; automatic search bounds within 0–51. |
 | `search.precision` | `0.1`; refinement step, at least 0.01 and no larger than the search interval. |
-| `search.max_trials` | `6` per codec; integer of at least 3, subject to the shared runtime budget. |
-| `runtime.target_seconds` | `180.0`: soft runtime target, checked before additional CRF trials after each codec's first attempt. |
+| `search.max_trials` | `12` per codec; integer of at least 3, subject to the shared runtime budget. Explicit custom caps are preserved. |
+| `runtime.target_seconds` | `180.0`: soft runtime target; up to three priority comparison trials per codec may use its remaining hard-budget share after this target. |
 | `runtime.max_seconds` | `300.0`: maximum runtime; stops an active worker at the deadline. Must be at least `target_seconds`. |
 
 Times accept seconds, `MM:SS`, or `HH:MM:SS`, including fractional seconds.
@@ -676,9 +678,13 @@ stream. Resolution remains at the source size apart from the resolved crop.
 The runtime budget is shared by all selected codecs and includes source
 inspection, crop detection, calibration, and CRF trials. Complete CRF trials
 alternate between codecs, with reserved shares of the remaining maximum
-budget so each can attempt its first trial even after the soft target. The
-target gates additional trials; a finished codec's unused share is distributed
-to the others. The maximum stops active work at the deadline.
+budget so each can attempt up to three priority comparison trials even after
+the soft target. Search can finish earlier if it converges or reaches a bound.
+The target gates further trials; a finished codec's unused share is
+distributed to the others. The maximum stops active work at the deadline.
+The twelve-trial default permits further refinement when QP changes
+nonlinearly; the runtime guard still limits total duration. An explicit
+`search.max_trials` value continues to impose its own cap.
 Both values must be positive finite seconds, with the target no greater than
 the maximum. Override them for one run with:
 
@@ -707,6 +713,10 @@ recommendations. The report records `time_limit` when the budget stops work
 and preserves completed results; an unfinished trial is not extrapolated into
 a measured row. Increase the runtime budget and sample-duration limit when
 longer measurements are needed.
+The five-minute maximum bounds runtime; it cannot guarantee three complete
+trials or a converged optimum on arbitrary hardware. If too few trials finish,
+the report identifies the best tested passing value as provisional and leaves
+the recommendation unset.
 
 ### Automatic black-margin crop
 
@@ -768,6 +778,9 @@ must be within 0–51; they are independent of the automatic search's configured
 bounds and trial limit. `--crf-values` and `--crf-range` are mutually exclusive.
 The global runtime budget also applies to sweeps, so a sweep can finish with
 only the rows completed before the deadline.
+Sweeps report the best tested passing CRF. They do not set an optimized
+recommendation, because the supplied values do not establish search
+convergence.
 
 ### Selection policy and outputs
 
@@ -780,13 +793,28 @@ The `qp_limit` field labels failures; the stricter `qp_target` drives selection.
 These are average-QP statistics, not per-frame or per-block upper limits, and
 do not guarantee visual transparency.
 
-Automatic search tests the initial CRF and nearby values, expands toward a
-pass/fail bracket, and uses local QP interpolation to choose further real
-encodes. It stops at the requested precision, a bound, the trial limit, the
-runtime budget, or observed nonmonotonic QP behavior. The recommendation is always the **highest
-tested passing CRF**, and may be absent if no tested value passed. Reaching a
-bound, trial limit, or runtime limit does not establish a global optimum. The same encoder
-settings and preset apply to every trial; only CRF changes.
+Automatic search first measures the configured initial CRF. If QP passes, the
+next trial increases CRF; if QP fails, it decreases CRF. Once measurements
+provide a local QP slope, interpolation proposes a further CRF to test. After
+a passing/failing bracket is found, the search refines that bracket to the
+configured precision. Every proposed CRF is actually encoded with the same
+settings, crop, and sample ranges. Progress messages explain the direction
+and the next CRF; a fitted prediction cannot become a measured result.
+
+The search stops at the requested precision, a bound, the trial limit, the
+runtime budget, or observed nonmonotonic QP behavior. `best_tested_crf` records
+the highest passing value among completed measurements. `recommended_crf`
+is set only after at least two distinct CRFs were measured and the search
+either reached the configured precision or measured a passing upper search
+bound. A single passing initial trial is provisional, with no `BEST` label or
+verified recommendation. Trial/time limits and nonmonotonic observations
+also leave an unconverged result provisional. The final recommendation, when
+available, is labelled `Recommended <codec> CRF` and includes its measured
+sample bitrate and QP statistics. Otherwise, a passing measurement is labelled
+`Best tested passing CRF (provisional)`. Printed next-CRF choices remain probes
+until their encodes finish; they are not unmeasured recommendations. Convergence
+within the configured search range does not establish an optimum beyond those
+bounds or guarantee full-movie quality.
 
 Normal and emergency bitrate values are preferences and warnings, not hard
 caps. High bitrate does not establish the presence of grain, so the report
@@ -803,18 +831,27 @@ and sample selection.
 
 The default output directory is `<movie-stem>.crf-search` beside the movie:
 
-- `summary.csv`: measured CRF/bitrate/QP table and recommendation flags.
+- `summary.csv`: measured CRF/bitrate/QP table, with separate `best_tested` and
+  `recommended` flags. `search_outcome`, `search_converged`, and
+  `recommendation_status` explain whether a recommendation was established.
 - `results.json`: source and encoder/library information, normalized config,
-  resolved crop detection, sample plan, individual measurements, recommendation,
+  resolved crop detection, sample plan, individual measurements, best tested
+  value, recommendation when established,
   search outcome, and
   a descriptive log-linear bitrate fit when at least three CRFs are measured.
 - `logs/`: individual encoder logs for diagnosis.
 - `cache/`: completed sample results, reused only for matching source identity,
   encoder settings, sample ranges, and library/backend versions.
 
+An automatic search that stops at its trial limit or on nonmonotonic
+observations without convergence records JSON `state: "incomplete"`. Runtime
+exhaustion records `state: "time_limit"`. A completed explicit sweep records
+`state: "complete"` while still leaving its optimized recommendation unset.
+
 Use `--output-dir` to choose another directory. Completed samples are cached
-through interruption; rerun the command to resume. Matching resumed runs reuse
-the fixed sample plan without recalibration. `--no-resume` forces fresh sample
+through interruption; rerun the original command to resume. Matching resumed
+runs reuse the fixed sample plan without recalibration and reuse prior
+completed encodes, including initial-CRF measurements. `--no-resume` forces fresh sample
 encodes. Changing the budget can change the calibrated sample ranges; only
 samples matching those ranges can be reused. Existing reports in the chosen directory are updated for the
 current run, so use separate output directories to retain multiple reports.

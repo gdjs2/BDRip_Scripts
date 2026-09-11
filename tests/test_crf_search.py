@@ -8,6 +8,7 @@ executable are needed.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 from fractions import Fraction
 import io
@@ -206,7 +207,15 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(all(14 <= crf <= 23 for crf in observations))
         self.assertEqual([row["crf"] for row in rows], sorted(observations))
         passing = [row["crf"] for row in rows if row["qp_pass"]]
-        self.assertEqual(summary["recommended_crf"], max(passing, default=None))
+        self.assertEqual(summary["best_tested_crf"], max(passing, default=None))
+        self.assertEqual(summary["comparison_complete"], len(rows) >= 2)
+        if summary["recommended_crf"] is not None:
+            self.assertIn(summary["recommended_crf"], passing)
+            self.assertTrue(summary["converged"])
+            self.assertTrue(summary["comparison_complete"])
+            self.assertTrue(summary["verified"])
+        else:
+            self.assertFalse(summary["verified"])
         self.assertEqual(summary["trials"], len(observations))
         return rows, summary
 
@@ -233,15 +242,26 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(min(row["crf"] for row in rows), 14)
         self.assertEqual(summary["reason"], "no_passing_crf_in_bounds")
 
-    def test_trial_budget_preserves_only_verified_recommendations(self):
+    def test_single_trial_yields_only_a_provisional_candidate(self):
         _, summary = self.run_search(lambda crf: crf + 1, max_trials=1)
-        self.assertEqual(summary["recommended_crf"], 17.5)
+        self.assertIsNone(summary["recommended_crf"])
+        self.assertEqual(summary["best_tested_crf"], 17.5)
+        self.assertFalse(summary["comparison_complete"])
+        self.assertFalse(summary["converged"])
+        self.assertFalse(summary["verified"])
         self.assertEqual(summary["reason"], "trial_limit")
 
     def test_nonmonotonic_observations_stop_refinement(self):
-        _, summary = self.run_search(lambda crf: 25 if crf < 17 else 15)
+        rows = [crf_search.summarize_trial(crf, [result(1, 1_000_000, {"I": qp})], policy())
+                for crf, qp in ((16.5, 25), (17.5, 15), (18.5, 15))]
+        candidate, summary = crf_search.next_trial(rows, policy(), {
+            "min_crf": 14.0, "max_crf": 23.0, "precision": 0.1, "max_trials": 12,
+        })
+        self.assertIsNone(candidate)
         self.assertEqual(summary["reason"], "nonmonotonic_observations")
-        self.assertEqual(summary["recommended_crf"], 18.5)
+        self.assertIsNone(summary["recommended_crf"])
+        self.assertEqual(summary["best_tested_crf"], 18.5)
+        self.assertFalse(summary["verified"])
 
     def test_upper_bound_need_not_be_a_precision_multiple(self):
         def evaluate(crf):
@@ -295,6 +315,33 @@ class SearchTests(unittest.TestCase):
 
 
 class RuntimePlanningTests(unittest.TestCase):
+    def test_sampling_identity_ignores_policy_but_tracks_encoding_budget_and_source(self):
+        signature = {
+            "source": {"path": "fixture.mkv", "size": 10, "mtime_ns": 1},
+            "versions": {"pyav": "test"}, "config": crf_search.load_config(),
+            "codecs": ["x264", "x265"], "crop": None, "backend_sha256": "test-backend",
+        }
+        signature["config"]["search"]["max_trials"] = 6
+        identity = crf_search.sampling_identity(signature)
+        changed_policy = copy.deepcopy(signature)
+        changed_policy["config"]["search"]["max_trials"] = 12
+        changed_policy["config"]["codecs"]["x264"]["qp_target"] = 19.4
+        self.assertEqual(crf_search.sampling_identity(changed_policy), identity)
+        self.assertEqual(crf_search.sampling_identity(identity), identity)
+
+        for path, value in (
+            (("config", "codecs", "x264", "params", "aq-strength"), "0.9"),
+            (("config", "runtime", "target_seconds"), 150.0),
+            (("source", "mtime_ns"), 2),
+        ):
+            with self.subTest(changed=path):
+                changed = copy.deepcopy(signature)
+                target = changed
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                self.assertNotEqual(crf_search.sampling_identity(changed), identity)
+
     def test_sample_floor_respects_lookahead_and_requested_duration(self):
         config = crf_search.load_config()
         config["sampling"]["seconds"] = 6.0
@@ -427,11 +474,11 @@ class PyAVIntegrationTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def cli(self, source, output, *extra):
+    def cli(self, source, output, *extra, automatic=False):
         return subprocess.run([
             sys.executable, str(ROOT / "scripts" / "crf_search.py"), str(source),
             "--config", str(self.config), "--output-dir", str(output),
-            "--crf-values", "16,23", *extra,
+            *([] if automatic else ["--crf-values", "16,23"]), *extra,
         ], cwd=ROOT, text=True, capture_output=True, timeout=60)
 
     def runtime_config(self, name, *, seconds, count):
@@ -492,6 +539,11 @@ class PyAVIntegrationTests(unittest.TestCase):
             table = list(csv.DictReader(handle))
         self.assertEqual(len(table), 4)
         self.assertEqual({row["codec"] for row in table}, {"x264", "x265"})
+        self.assertTrue(all(row["recommended"] == "False" for row in table))
+        for analysis in report["codecs"].values():
+            self.assertIsNone(analysis["search"]["recommended_crf"])
+            self.assertFalse(analysis["search"]["verified"])
+            self.assertTrue(analysis["search"]["comparison_complete"])
         log_times = {path: path.stat().st_mtime_ns for path in (output / "logs").glob("*.log")}
         self.assertEqual(len(log_times), 4)
         with (mock.patch.object(crf_search, "run_process",
@@ -517,6 +569,30 @@ class PyAVIntegrationTests(unittest.TestCase):
         self.assertEqual(rows[0]["bitrate_mbps"], rows[1]["bitrate_mbps"])
         self.assertEqual(rows[0]["qp95"], rows[1]["qp95"])
         self.assertEqual(rows[0]["samples"][0]["frames"], 12)
+
+    def test_real_automatic_search_compares_native_encodes_before_recommending(self):
+        output = self.directory / "native-automatic-search"
+        completed = self.cli(self.source, output, "--codec", "both", automatic=True)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        for codec in ("x264", "x265"):
+            analysis = report["codecs"][codec]
+            rows = analysis["rows"]
+            self.assertGreaterEqual(len({row["crf"] for row in rows}), 2)
+            passing = [row["crf"] for row in rows if row["qp_pass"]]
+            self.assertEqual(analysis["search"]["best_tested_crf"], max(passing, default=None))
+            self.assertTrue(analysis["search"]["comparison_complete"])
+            for row in rows:
+                self.assertGreaterEqual(row["crf"], report["config"]["search"]["min_crf"])
+                self.assertLessEqual(row["crf"], report["config"]["search"]["max_crf"])
+                self.assertEqual(float(row["samples"][0]["encoder_options"]["crf"]), row["crf"])
+                self.assertFalse(row["samples"][0]["cached"])
+            if analysis["search"]["recommended_crf"] is not None:
+                self.assertEqual(analysis["search"]["recommended_crf"], max(passing))
+                self.assertTrue(analysis["search"]["converged"])
+                self.assertTrue(analysis["search"]["verified"])
+            else:
+                self.assertFalse(analysis["search"]["verified"])
 
     def test_audio_only_source_fails_clearly(self):
         completed = self.cli(self.audio_only, self.directory / "no-video", "--codec", "x264")
@@ -597,8 +673,11 @@ class PyAVIntegrationTests(unittest.TestCase):
             self.assertEqual([sample["sample"] for sample in samples], report["sample_plan"])
             self.assertEqual([sample["duration"] for sample in samples], [4.0, 4.0])
 
-    def test_rerun_reuses_calibrated_plan_without_pilots_or_recalculation(self):
+    def test_legacy_calibrated_plan_survives_policy_changes_without_recalibration(self):
         config = self.runtime_config("calibration-resume", seconds=6, count=2)
+        config_data = json.loads(config.read_text(encoding="utf-8"))
+        config_data["search"] = {"max_trials": 6}
+        config.write_text(json.dumps(config_data), encoding="utf-8")
         output = self.directory / "calibration-resume"
         jobs = []
         argv = [str(self.source), "--config", str(config), "--output-dir", str(output),
@@ -616,6 +695,14 @@ class PyAVIntegrationTests(unittest.TestCase):
             choose.assert_called_once()
             self.assertEqual([job["duration"] for job in jobs[:2]], [3.0, 3.0])
             original = json.loads((output / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(original["config"]["search"]["max_trials"], 6)
+            original_jobs = jobs[2:].copy()
+            # Earlier reports put the full config in the calibration signature.
+            original["sampling_calibration"]["signature"]["config"] = copy.deepcopy(original["config"])
+            (output / "results.json").write_text(json.dumps(original), encoding="utf-8")
+            config_data["search"]["max_trials"] = 12
+            config_data["codecs"]["x264"]["qp_target"] = 19.4
+            config.write_text(json.dumps(config_data), encoding="utf-8")
             jobs.clear()
             with mock.patch.object(crf_search, "choose_sample_seconds",
                                    side_effect=AssertionError("A resumed plan must not be recalibrated")):
@@ -623,6 +710,9 @@ class PyAVIntegrationTests(unittest.TestCase):
         resumed = json.loads((output / "results.json").read_text(encoding="utf-8"))
         self.assertEqual(resumed["sample_plan"], original["sample_plan"])
         self.assertEqual(resumed["sampling_calibration"]["seconds"], 4.0)
+        self.assertEqual(resumed["config"]["search"]["max_trials"], 12)
+        self.assertEqual(resumed["config"]["codecs"]["x264"]["qp_target"], 19.4)
+        self.assertEqual(jobs, original_jobs)
         self.assertEqual(len(jobs), 4)
         self.assertTrue(all(job["duration"] == 4.0 for job in jobs))
         self.assertEqual({job["codec"] for job in jobs}, {"x264", "x265"})
@@ -631,9 +721,9 @@ class PyAVIntegrationTests(unittest.TestCase):
             self.assertEqual([sample["sample"] for sample in analysis["rows"][0]["samples"]],
                              original["sample_plan"])
 
-    def test_each_codec_gets_first_trial_after_target_if_hard_budget_remains(self):
-        config = self.runtime_config("first-trial-reservation", seconds=0.25, count=1)
-        output = self.directory / "first-trial-reservation"
+    def test_user_qp_rows_trigger_comparison_trials_after_target_with_hard_time_remaining(self):
+        config = self.runtime_config("comparison-reservation", seconds=0.25, count=1)
+        output = self.directory / "comparison-reservation"
         clock = [100.0]
         jobs = []
         base_probe = self.mocked_probe(1)
@@ -641,18 +731,19 @@ class PyAVIntegrationTests(unittest.TestCase):
         def probe(operation, *args, **kwargs):
             result = base_probe(operation, *args, **kwargs)
             if operation == "inspect":
-                clock[0] += 120.0
+                clock[0] += 179.0
             return result
 
         def encode(job, *_args, **kwargs):
             self.assertGreater(kwargs["timeout"], 0)
             jobs.append(job)
-            elapsed = 80.0 if job["codec"] == "x264" else 1.0
+            elapsed = 3.0
             self.assertLessEqual(elapsed, kwargs["timeout"])
-            if job["codec"] == "x265":
+            if len(jobs) > 1:
                 self.assertGreater(clock[0] - 100.0, 180.0)
             clock[0] += elapsed
-            return {**self.mocked_sample(job), "wall_seconds": elapsed}
+            qp = job["crf"] + (1.806 if job["codec"] == "x264" else 4.49050595)
+            return {**self.mocked_sample(job), "wall_seconds": elapsed, "qp": {"I": qp}}
 
         with (mock.patch.object(crf_search, "run_probe", side_effect=probe),
               mock.patch.object(crf_search, "run_sample", side_effect=encode),
@@ -662,17 +753,31 @@ class PyAVIntegrationTests(unittest.TestCase):
                 str(self.source), "--config", str(config), "--output-dir", str(output),
                 "--codec", "both", "--target-seconds", "180", "--max-seconds", "300",
             ]), 0)
-        self.assertEqual([job["codec"] for job in jobs], ["x264", "x265"])
         report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["state"], "time_limit")
-        self.assertEqual(report["runtime"]["elapsed_seconds"], 201.0)
-        for codec, initial in (("x264", 17.5), ("x265", 18.5)):
+        self.assertEqual(report["state"], "complete")
+        self.assertGreater(report["runtime"]["elapsed_seconds"], 180.0)
+        self.assertLessEqual(report["runtime"]["elapsed_seconds"], 300.0)
+        for codec, initial, initial_qp, expected in (
+            ("x264", 17.5, 19.306, 17.6),
+            ("x265", 18.5, 22.99050595, 16.0),
+        ):
             analysis = report["codecs"][codec]
-            self.assertEqual([row["crf"] for row in analysis["rows"]], [initial])
-            self.assertEqual(analysis["search"]["reason"], "time_limit")
-            self.assertEqual(analysis["search"]["recommended_crf"], initial)
+            measured = [job["crf"] for job in jobs if job["codec"] == codec]
+            self.assertEqual(measured[0], initial)
+            if codec == "x264":
+                self.assertGreater(measured[1], initial)
+            else:
+                self.assertLess(measured[1], initial)
+            self.assertGreaterEqual(len(set(measured)), 3)
+            initial_row = next(row for row in analysis["rows"] if row["crf"] == initial)
+            self.assertAlmostEqual(initial_row["qp95"], initial_qp)
+            self.assertEqual(analysis["search"]["recommended_crf"], expected)
+            self.assertEqual(analysis["search"]["best_tested_crf"], expected)
+            self.assertTrue(analysis["search"]["comparison_complete"])
+            self.assertTrue(analysis["search"]["converged"])
+            self.assertTrue(analysis["search"]["verified"])
 
-    def test_deadline_discards_partial_trial_and_preserves_both_codec_recommendations(self):
+    def test_deadline_discards_partial_trial_and_preserves_both_codec_candidates(self):
         config = self.runtime_config("partial-deadline", seconds=0.25, count=2)
         output = self.directory / "partial-deadline"
         clock = [100.0]
@@ -684,7 +789,7 @@ class PyAVIntegrationTests(unittest.TestCase):
             self.assertGreater(kwargs["timeout"], 0)
             self.assertLessEqual(kwargs["timeout"], 10)
             jobs.append(job)
-            if len(jobs) == 6:
+            if len(jobs) >= 6:
                 clock[0] += kwargs["timeout"]
                 raise crf_search.BudgetExpired("sample exceeded remaining time")
             clock[0] += 1.0
@@ -699,7 +804,7 @@ class PyAVIntegrationTests(unittest.TestCase):
                 "--codec", "both", "--target-seconds", "8", "--max-seconds", "10",
             ])
         self.assertEqual([job["codec"] for job in jobs[:4]], ["x264", "x264", "x265", "x265"])
-        self.assertEqual(len(jobs), 6)
+        self.assertGreaterEqual(len(jobs), 6)
         report = json.loads((output / "results.json").read_text(encoding="utf-8"))
         self.assertEqual(report["state"], "time_limit")
         self.assertEqual(report["config"]["runtime"], {"target_seconds": 8.0, "max_seconds": 10.0})
@@ -708,13 +813,15 @@ class PyAVIntegrationTests(unittest.TestCase):
             analysis = report["codecs"][codec]
             self.assertEqual([row["crf"] for row in analysis["rows"]], [initial])
             self.assertEqual(len(analysis["rows"][0]["samples"]), 2)
-            self.assertEqual(analysis["search"]["recommended_crf"], initial)
-            self.assertTrue(analysis["search"]["verified"])
+            self.assertIsNone(analysis["search"]["recommended_crf"])
+            self.assertEqual(analysis["search"]["best_tested_crf"], initial)
+            self.assertFalse(analysis["search"]["comparison_complete"])
+            self.assertFalse(analysis["search"]["verified"])
         with (output / "summary.csv").open(encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all(row["recommended"] == "True" for row in rows))
-        self.assertIn("Highest tested passing CRF", display.getvalue())
+        self.assertTrue(all(row["recommended"] == "False" for row in rows))
+        self.assertIn("provisional", display.getvalue().lower())
 
     def test_settings_print_before_first_pilot_and_pilot_timeout_still_writes_report(self):
         config = self.runtime_config("pilot-deadline", seconds=6, count=2)
