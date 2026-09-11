@@ -77,12 +77,18 @@ def tail(path: Path, limit: int = 64 * 1024) -> str:
 
 
 class Window(QMainWindow):
-    def __init__(self, workspace: Path, config_path: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        config_path: Path | None = None,
+        *,
+        output_root: Path | None = None,
+    ):
         super().__init__()
         self.setWindowTitle("CRF Video Queue")
         self.resize(1150, 850)
         self.config = load_config(config_path)
-        self.queue = TaskQueue(workspace, self)
+        self.queue = TaskQueue(workspace, self, output_root=output_root)
         self.closing = False
         self.items: dict[str, QTreeWidgetItem] = {}
         self.selected_id = None
@@ -412,6 +418,7 @@ class Window(QMainWindow):
         )
         self.remove_button.setEnabled(bool(task and task is not self.queue.active))
         self.folder_button.setEnabled(bool(task))
+        self.folder_button.setToolTip(str(self.queue.output(task)) if task else "")
         self.figure_button.setEnabled(
             bool(
                 task
@@ -547,7 +554,12 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace",
         type=Path,
         default=Path.cwd() / "crf-tasks",
-        help="Folder for the saved queue and each task's figures, reports, and logs",
+        help="Folder for saved queue state (task results default to beside each video)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Parent folder for new task results (default: crf-tasks beside each video)",
     )
     parser.add_argument(
         "--config", type=Path, help="Initial video and encoder configuration"
@@ -556,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication([sys.argv[0]])
     app.setApplicationName("CRF Video Queue")
     try:
-        window = Window(args.workspace, args.config)
+        window = Window(args.workspace, args.config, output_root=args.output_dir)
     except (OSError, ValueError) as exc:
         QMessageBox.critical(None, "Cannot open queue", str(exc))
         return 1

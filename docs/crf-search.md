@@ -32,8 +32,11 @@ Existing configs and task folders remain readable. See
 ```sh
 uv run --extra gui bdrip gui --config crf_search.example.json
 
-# Choose a persistent queue/results folder:
+# Choose a persistent queue-state folder:
 uv run --extra gui bdrip gui --workspace "/path/to/CRF tasks"
+
+# Optionally store all new task results in one location instead of beside each video:
+uv run --extra gui bdrip gui --output-dir "/path/to/CRF results"
 ```
 
 Choose the **Samples** count, **Seconds each**, codec, and crop, optionally edit
@@ -111,13 +114,14 @@ without automatically starting them. Only one GUI can open a workspace at a
 time. If the GUI was forcibly terminated and its worker is still running, wait
 for that worker to finish before reopening the workspace.
 
-The default workspace is `crf-tasks/` in the current working directory. Each
-task uses a unique subdirectory, even for duplicate filenames:
+The queue workspace defaults to `crf-tasks/` in the current working directory;
+it holds `queue.json` and process locks. **New task logs and results default to
+`crf-tasks/` beside the input video**, with a unique task subdirectory even for
+duplicate filenames. For an input at `/movies/Movie/Streams/movie.mkv`:
 
 ```text
-crf-tasks/
-  queue.json
-  Movie-<unique-task-id>/
+/movies/Movie/Streams/crf-tasks/
+  movie-<unique-task-id>/
     config.json             # Task settings snapshot
     task.log                # Combined output, appended on retry
     progress.json           # Task stage, codec, CRF, overall progress
@@ -131,6 +135,13 @@ crf-tasks/
     logs/                   # Native encoder logs, including previous attempts
     cache/                  # Completed encodes for resuming
 ```
+
+**Open results folder** opens this task directory. `task.log` contains the
+combined task output, while `logs/` holds individual x264/x265 encoder logs.
+`--output-dir` overrides the parent directory for newly added tasks; `--workspace`
+only changes the queue-state location. Each task saves its output path, so
+reopening the GUI or retrying a task keeps using that path. Existing queues
+retain their original result folders; no saved logs or figures are moved.
 
 ## Command line
 
@@ -146,7 +157,8 @@ uv run bdrip crf "movie.mkv" --samples 10 --sample-seconds 10 --seed 0
 ```
 
 Both codecs run by default. The default output directory beside the source is
-`<movie-stem>.crf-model/`. The encoder options are printed before encoding,
+`<movie-stem>.crf-model/`, with encoder logs under `logs/`. Use `--output-dir`
+to choose another location. The encoder options are printed before encoding,
 followed by all sample starts/durations, the mean endpoint table, and fitted equations.
 
 | File | Contents |

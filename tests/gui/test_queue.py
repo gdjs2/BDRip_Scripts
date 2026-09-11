@@ -92,6 +92,13 @@ class QueueTests(unittest.TestCase):
             [str(self.source), str(self.source)], self.config, "both"
         )
         self.assertNotEqual(self.queue.output(first), self.queue.output(second))
+        for task in (first, second):
+            self.assertEqual(
+                self.queue.output(task).parent, self.source.parent / "crf-tasks"
+            )
+            self.assertFalse(
+                self.queue.output(task).is_relative_to(self.queue.workspace)
+            )
         self.config["codecs"]["x264"]["preset"] = "fast"
         self.assertEqual(first.config["codecs"]["x264"]["preset"], "ultrafast")
         first.config["video"]["cropdetect"]["seconds"] = 3
@@ -106,6 +113,9 @@ class QueueTests(unittest.TestCase):
                 [task.id for task in restored.tasks], [first.id, second.id]
             )
             self.assertEqual(
+                restored.output(restored.tasks[0]), self.queue.output(first)
+            )
+            self.assertEqual(
                 restored.tasks[0].config["video"]["cropdetect"]["seconds"], 3
             )
             self.assertFalse(restored.enabled)
@@ -113,6 +123,40 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(restored.tasks[0].state, "cancelled")
             restored.remove(restored.tasks[0])
             self.assertTrue((restored.output(first) / "config.json").is_file())
+        finally:
+            restored.close()
+
+    def test_each_video_gets_results_in_its_own_stream_directory(self):
+        sources = []
+        for name in ("Movie One", "Movie Two"):
+            source = self.directory / name / "Streams" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(self.source.read_bytes())
+            sources.append(source)
+        tasks = self.queue.add([str(source) for source in sources], self.config, "x264")
+        for task, source in zip(tasks, sources):
+            output = source.parent / "crf-tasks" / task.folder
+            self.assertEqual(self.queue.output(task), output)
+            self.assertTrue((output / "config.json").is_file())
+            self.assertEqual(task.output_dir, str(output))
+
+    def test_output_override_is_saved_per_task_and_survives_retry(self):
+        root = self.directory / "custom results"
+        queue = TaskQueue(self.directory / "custom queue", output_root=root)
+        try:
+            task = queue.add([str(self.source)], self.config, "x264")[0]
+            output = root / task.folder
+            self.assertEqual(queue.output(task), output)
+            queue.cancel(task)
+        finally:
+            queue.close()
+        changed_root = self.directory / "different results"
+        restored = TaskQueue(queue.workspace, output_root=changed_root)
+        try:
+            retried = restored.retry(restored.tasks[0])
+            self.assertEqual(restored.output(retried), output)
+            added = restored.add([str(self.source)], self.config, "x264")[0]
+            self.assertEqual(restored.output(added), changed_root / added.folder)
         finally:
             restored.close()
 
@@ -295,6 +339,7 @@ class QueueTests(unittest.TestCase):
         self.assertGreaterEqual(second.started, first.finished)
         for task, count in ((first, 4), (second, 2)):
             output = self.queue.output(task)
+            self.assertEqual(output.parent, self.source.parent / "crf-tasks")
             for filename in (
                 "config.json",
                 "progress.json",
@@ -460,6 +505,10 @@ class QueueTests(unittest.TestCase):
         waiting, history = self.queue.add(
             [str(self.source), str(self.source)], self.config, "x264"
         )
+        for task in (waiting, history):
+            output = self.queue.output(task)
+            task.output_dir = None
+            output.rename(self.queue.output(task))
         history.state, history.attempts = "cancelled", 1
         self.queue.save()
         path = self.queue.workspace / "queue.json"
@@ -467,6 +516,7 @@ class QueueTests(unittest.TestCase):
         data["schema_version"] = 1
         for item in data["tasks"]:
             item.pop("method")
+            item.pop("output_dir")
             item["config"]["sampling"] = {"count": 10, "seed": 42}
         path.write_text(json.dumps(data))
         output = self.queue.output(history)
@@ -481,6 +531,7 @@ class QueueTests(unittest.TestCase):
         restored = TaskQueue(self.queue.workspace)
         try:
             waiting, history = restored.tasks
+            self.assertEqual(restored.output(history), output)
             self.assertEqual(waiting.method, "two_point")
             self.assertEqual(
                 waiting.config["sampling"], {"count": 10, "seconds": 10, "seed": 42}
@@ -494,12 +545,15 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(history.state, "cancelled")
             for filename, contents in original.items():
                 self.assertEqual((output / filename).read_text(), contents)
-            self.assertEqual(json.loads(path.read_text())["schema_version"], 2)
+            self.assertEqual(json.loads(path.read_text())["schema_version"], 3)
         finally:
             restored.close()
 
     def test_retry_keeps_old_single_clip_artifacts_in_original_folder(self):
         history = self.queue.add([str(self.source)], self.config, "x264")[0]
+        previous = self.queue.output(history)
+        history.output_dir = None
+        previous.rename(self.queue.output(history))
         history.state, history.attempts = "cancelled", 1
         history.config.pop("sampling")
         original_config = json.loads(json.dumps(history.config))
@@ -508,10 +562,16 @@ class QueueTests(unittest.TestCase):
         artifact.write_text('{"schema_version":4,"sample_plan":[{"duration":60}]}')
         original = artifact.read_bytes()
         self.queue.save()
+        path = self.queue.workspace / "queue.json"
+        data = json.loads(path.read_text())
+        data["schema_version"] = 2
+        data["tasks"][0].pop("output_dir")
+        path.write_text(json.dumps(data))
         self.queue.close()
         restored = TaskQueue(self.queue.workspace)
         try:
             history = restored.tasks[0]
+            self.assertEqual(restored.output(history), output)
             self.assertEqual(history.config, original_config)
             retried = restored.retry(history)
             self.assertNotEqual(restored.output(retried), output)

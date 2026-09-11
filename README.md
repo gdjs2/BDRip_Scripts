@@ -27,6 +27,7 @@ Sample count and duration are configurable. The GUI queues videos in background
 processes and shows the fitted QP and exponential bitrate curves with hover estimates and
 click-to-pin selection. Reports retain individual clip measurements, endpoint
 means, figures, and logs. Encoder settings and exact cropping are preserved.
+New GUI tasks save their logs and results under `crf-tasks/` beside each input video.
 
 See the [calibration and GUI guide](docs/crf-search.md) for encoder options,
 progress, saved figures, logs, and result interpretation.

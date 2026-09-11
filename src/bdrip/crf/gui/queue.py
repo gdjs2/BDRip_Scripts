@@ -50,6 +50,7 @@ class Task:
     finished: float | None = None
     error: str = ""
     method: str = METHOD
+    output_dir: str | None = None
 
     @property
     def folder(self) -> str:
@@ -78,9 +79,12 @@ class TaskQueue(QObject):
     changed = Signal()
     problem = Signal(str)
 
-    def __init__(self, workspace: Path, parent=None):
+    def __init__(
+        self, workspace: Path, parent=None, *, output_root: Path | None = None
+    ):
         super().__init__(parent)
         self.workspace = workspace.expanduser().resolve()
+        self.output_root = output_root.expanduser().resolve() if output_root else None
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.lock = QLockFile(str(self.workspace / "queue.lock"))
         self.lock.setStaleLockTime(0)
@@ -112,7 +116,11 @@ class TaskQueue(QObject):
         self.timer.start()
 
     def output(self, task: Task) -> Path:
-        return self.workspace / task.folder
+        # Old queues stored task files under the workspace. Keep those paths
+        # while new tasks record their destination beside the selected video.
+        return (
+            Path(task.output_dir) if task.output_dir else self.workspace / task.folder
+        )
 
     def _load(self) -> None:
         path = self.workspace / "queue.json"
@@ -120,7 +128,7 @@ class TaskQueue(QObject):
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data["schema_version"] not in {1, 2} or not isinstance(
+            if data["schema_version"] not in {1, 2, 3} or not isinstance(
                 data["tasks"], list
             ):
                 raise ValueError("Unsupported queue format")
@@ -133,6 +141,13 @@ class TaskQueue(QObject):
                     or not isinstance(task.video, str)
                     or not isinstance(task.progress, dict)
                     or task.method not in {METHOD, "sweep"}
+                    or (
+                        task.output_dir is not None
+                        and (
+                            not isinstance(task.output_dir, str)
+                            or not Path(task.output_dir).is_absolute()
+                        )
+                    )
                 ):
                     raise ValueError("Invalid saved task")
                 normalized_config = validate_config(task.config)
@@ -178,7 +193,7 @@ class TaskQueue(QObject):
     def save(self) -> None:
         write_json(
             self.workspace / "queue.json",
-            {"schema_version": 2, "tasks": [asdict(task) for task in self.tasks]},
+            {"schema_version": 3, "tasks": [asdict(task) for task in self.tasks]},
         )
 
     def add(self, videos: list[str], config: dict, codec: str) -> list[Task]:
@@ -197,6 +212,9 @@ class TaskQueue(QObject):
                 codec,
                 validate_config(config),
                 datetime.now(timezone.utc).isoformat(),
+            )
+            task.output_dir = str(
+                (self.output_root or path.parent / "crf-tasks") / task.folder
             )
             write_json(self.output(task) / "config.json", task.config)
             added.append(task)
