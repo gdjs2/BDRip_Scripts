@@ -28,7 +28,7 @@ class ConfigTests(unittest.TestCase):
         config = validate_config({"sampling": {"count": 3}, "codecs": {"x264": {"preset": "fast"}}})
         config["codecs"]["x264"]["params"]["bframes"] = "2"
         self.assertEqual(config["sampling"]["count"], 3)
-        self.assertEqual(config["sampling"]["seconds"], 6.0)
+        self.assertEqual(config["sampling"]["min_seconds"], 5.0)
         self.assertEqual(load_config()["codecs"]["x264"]["params"]["bframes"], "10")
         self.assertEqual(DEFAULT_CONFIG["codecs"]["x264"]["preset"], "placebo")
 
@@ -43,32 +43,32 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((codec["preset"], codec["profile"], codec["level"]),
                              (preset, profile, level))
 
-    def test_runtime_defaults_and_partial_overrides(self):
+    def test_random_sampling_defaults_and_fixed_duration(self):
         config = load_config()
-        self.assertEqual(config["runtime"], {"target_seconds": 180.0, "max_seconds": 300.0})
-        self.assertEqual(config["sampling"]["count"], 10)
-        self.assertEqual(config["sampling"]["seconds"], 6.0)
-        self.assertEqual(config["search"]["max_trials"], 12)
-        config = validate_config({"runtime": {"target_seconds": 120}})
-        self.assertEqual(config["runtime"], {"target_seconds": 120.0, "max_seconds": 300.0})
-        self.assertIsInstance(config["runtime"]["target_seconds"], float)
-        config["runtime"]["max_seconds"] = 200
-        self.assertEqual(load_config()["runtime"]["max_seconds"], 300.0)
-        self.assertEqual(validate_config({"runtime": {"target_seconds": 300}})["runtime"],
-                         {"target_seconds": 300.0, "max_seconds": 300.0})
-        for cap in (3, 6, 20):
-            with self.subTest(max_trials=cap):
-                self.assertEqual(validate_config({"search": {"max_trials": cap}})["search"]["max_trials"], cap)
+        self.assertEqual(config["sampling"], {
+            "count": 10, "min_seconds": 5.0, "max_seconds": 10.0,
+            "seed": 0, "start": 0.0, "end": None,
+        })
+        self.assertEqual(set(config), {"video", "sampling", "codecs"})
+        fixed = validate_config({"sampling": {"min_seconds": 7, "max_seconds": 7, "seed": 123}})
+        self.assertEqual(fixed["sampling"]["min_seconds"], 7.0)
+        self.assertEqual(fixed["sampling"]["max_seconds"], 7.0)
+        self.assertEqual(fixed["sampling"]["seed"], 123)
 
-    def test_runtime_requires_positive_finite_consistent_budgets(self):
-        for field in ("target_seconds", "max_seconds"):
-            for value in (0, -1, True, None, "180", float("nan"), float("inf")):
+    def test_invalid_random_sampling_settings(self):
+        for field in ("min_seconds", "max_seconds"):
+            for value in (0, -1, True, None, "5", float("nan"), float("inf")):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
-                    validate_config({"runtime": {field: value}})
-        for runtime in (None, [], {"target_seconds": 301}, {"max_seconds": 179},
-                        {"target_seconds": 60, "max_seconds": 30}, {"timeout": 300}):
-            with self.subTest(runtime=runtime), self.assertRaises(ValueError):
-                validate_config({"runtime": runtime})
+                    validate_config({"sampling": {field: value}})
+        for value in (-1, True, 1.5, None, "0"):
+            with self.subTest(seed=value), self.assertRaises(ValueError):
+                validate_config({"sampling": {"seed": value}})
+        with self.assertRaises(ValueError):
+            validate_config({"sampling": {"min_seconds": 11, "max_seconds": 10}})
+        for old_setting in ({"runtime": {}}, {"search": {}},
+                            {"codecs": {"x264": {"qp_target": 19.5}}}):
+            with self.subTest(old_setting=old_setting), self.assertRaisesRegex(ValueError, "Unknown config key"):
+                validate_config(old_setting)
 
     def test_auto_manual_and_disabled_crop_are_distinct(self):
         for crop in ("auto", "1920:800:0:140", "1920:804:0:137", "1280:720:1:3", None):
@@ -139,34 +139,18 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Unknown config key"):
                     validate_config(config)
 
-    def test_invalid_policy_and_sampling_are_errors(self):
+    def test_invalid_sampling_and_encoder_settings_are_errors(self):
         configs = [
-            {"sampling": {"count": True}},
-            {"sampling": {"count": 1.5}},
-            {"sampling": {"seconds": 0}},
-            {"sampling": {"seconds": float("nan")}},
-            {"sampling": {"start": 5, "end": 3}},
-            {"sampling": {"stress_starts": ["00:01", 1]}},
-            {"search": {"min_crf": 24, "max_crf": 23}},
-            {"search": {"max_crf": 52}},
-            {"search": {"precision": 0}},
-            {"search": {"precision": 0.001}},
-            {"search": {"max_trials": 0}},
-            {"search": {"max_trials": 2}},
-            {"codecs": {"x264": {"initial_crf": 30}}},
-            {"codecs": {"x264": {"qp_target": 20}}},
-            {"codecs": {"x264": {"normal_bitrate_mbps": [15, 8]}}},
-            {"codecs": {"x264": {"emergency_bitrate_mbps": 10}}},
+            {"sampling": {"count": True}}, {"sampling": {"count": 1.5}},
+            {"sampling": {"count": 0}}, {"sampling": {"start": 5, "end": 3}},
             {"codecs": {"x264": {"pixel_format": "yuv420p10le"}}},
             {"codecs": {"x265": {"profile": "main"}}},
-            {"video": {"stream": -1}},
-            {"video": {"crop": "1920:801:0:1"}},
+            {"video": {"stream": -1}}, {"video": {"crop": "1920:801:0:1"}},
             {"video": {"crop": "iw:ih:0:0"}},
         ]
         for config in configs:
-            with self.subTest(config=config):
-                with self.assertRaises(ValueError):
-                    validate_config(config)
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                validate_config(config)
 
     def test_conflicting_search_or_log_options_are_errors(self):
         for field in ("params", "options"):

@@ -1,19 +1,8 @@
-"""CRF search correctness and PyAV smoke tests.
+"""Random sample selection, averaged metrics, plotting and native CRF sweeps."""
 
-Run with ``uv run python -m unittest discover -s tests -v``.
-The integration fixture is generated through PyAV; no media files or FFmpeg
-executable are needed.
-"""
-
-from __future__ import annotations
-
-import argparse
-import copy
 import csv
 from fractions import Fraction
-import io
 import json
-import math
 from pathlib import Path
 import subprocess
 import sys
@@ -22,28 +11,12 @@ import unittest
 from unittest import mock
 
 import av
+from PIL import Image
 
 from scripts import crf_search
-
+from scripts.crf_plot import make_figure
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def sampling(**overrides):
-    return {"count": 10, "seconds": 45.0, "start": 0.0, "end": None,
-            "stress_starts": [], **overrides}
-
-
-def policy(**overrides):
-    return {"initial_crf": 17.5, "qp_target": 19.5,
-            "qp_limit": 20.0, "normal_bitrate_mbps": [8.0, 15.0],
-            "emergency_bitrate_mbps": 28.0, **overrides}
-
-
-def result(duration, video_bytes, qp, *, kind="representative", start=0.0):
-    return {"sample": {"kind": kind, "start": start, "duration": duration},
-            "duration": duration, "video_bytes": video_bytes,
-            "frames": max(1, round(duration * 24)), "qp": qp}
 
 
 def make_media(path, *, audio=True, video=True, borders=False):
@@ -95,357 +68,162 @@ def make_media(path, *, audio=True, video=True, borders=False):
                     output.mux(packet)
 
 
-class PercentileTests(unittest.TestCase):
-    def test_linear_quantile_is_order_independent(self):
-        self.assertAlmostEqual(crf_search.percentile([4, 1, 3, 2], 0.95), 3.85)
-
-    def test_single_value_and_endpoints(self):
-        self.assertEqual(crf_search.percentile([7], 0.95), 7)
-        self.assertEqual(crf_search.percentile([3, 1, 2], 0), 1)
-        self.assertEqual(crf_search.percentile([3, 1, 2], 1), 3)
-
-    def test_empty_values_rejected(self):
-        with self.assertRaises(ValueError):
-            crf_search.percentile([], 0.95)
-
-
 class SamplingTests(unittest.TestCase):
-    def assert_ranges_valid(self, samples, start, end):
-        representative = sorted(
-            (item for item in samples if item["kind"] == "representative"),
-            key=lambda item: item["start"],
-        )
-        self.assertTrue(representative)
-        previous_end = start
-        for item in representative:
-            self.assertGreater(item["duration"], 0)
-            self.assertGreaterEqual(item["start"] + 1e-9, previous_end)
-            self.assertLessEqual(item["start"] + item["duration"], end + 1e-9)
-            previous_end = item["start"] + item["duration"]
+    def plan(self, duration=600, **overrides):
+        sampling = {**crf_search.load_config()["sampling"], **overrides}
+        return crf_search.select_samples(duration, sampling)
 
-    def test_short_source_reduces_sampling_without_overlap(self):
-        samples = crf_search.select_samples(15, sampling())
-        self.assertLessEqual(len(samples), 10)
-        self.assert_ranges_valid(samples, 0, 15)
+    def test_seeded_clips_are_random_and_uniformly_distributed_without_overlap(self):
+        samples = self.plan(start=30, end=570, seed=17)
+        self.assertEqual(len(samples), 10)
+        self.assertEqual(samples, self.plan(start=30, end=570, seed=17))
+        self.assertNotEqual(samples, self.plan(start=30, end=570, seed=18))
+        lengths = set()
+        previous_end = 30
+        for index, sample in enumerate(samples):
+            left, right = 30 + index * 54, 30 + (index + 1) * 54
+            self.assertGreaterEqual(sample["start"], left)
+            self.assertLessEqual(sample["start"] + sample["duration"], right + 1e-9)
+            self.assertGreaterEqual(sample["duration"], 5)
+            self.assertLessEqual(sample["duration"], 10)
+            self.assertGreaterEqual(sample["start"], previous_end)
+            previous_end = sample["start"] + sample["duration"]
+            lengths.add(sample["duration"])
+        self.assertGreater(len(lengths), 1)
 
-    def test_subsecond_source_is_still_sampled(self):
-        self.assert_ranges_valid(crf_search.select_samples(0.02, sampling()), 0, 0.02)
+    def test_random_positions_cover_each_bin_instead_of_always_using_centers(self):
+        relative = []
+        durations = []
+        for seed in range(200):
+            sample = self.plan(duration=100, count=1, seed=seed)[0]
+            relative.append(sample["start"] / (100 - sample["duration"]))
+            durations.append(sample["duration"])
+        self.assertAlmostEqual(sum(relative) / len(relative), 0.5, delta=0.06)
+        self.assertLess(min(relative), 0.05)
+        self.assertGreater(max(relative), 0.95)
+        self.assertAlmostEqual(sum(durations) / len(durations), 7.5, delta=0.3)
 
-    def test_selected_interval_is_respected(self):
-        samples = crf_search.select_samples(
-            600, sampling(count=4, seconds=20, start=30, end=570))
-        self.assertEqual(len(samples), 4)
-        self.assert_ranges_valid(samples, 30, 570)
-        self.assertEqual(samples, crf_search.select_samples(
-            600, sampling(count=4, seconds=20, start=30, end=570)))
+    def test_fixed_duration_and_short_strata(self):
+        self.assertTrue(all(s["duration"] == 7 for s in self.plan(min_seconds=7, max_seconds=7)))
+        samples = self.plan(duration=60)
+        self.assertEqual(len(samples), 10)
+        self.assertTrue(all(5 <= sample["duration"] <= 6 for sample in samples))
+        with self.assertRaisesRegex(ValueError, "cannot fit"):
+            self.plan(duration=49)
 
-    def test_invalid_sampling_is_rejected(self):
-        for overrides in ({"count": 0}, {"seconds": 0}, {"start": -1},
-                          {"start": 20, "end": 10}, {"start": 100}):
+    def test_invalid_bounds_do_not_silently_change_the_requested_interval(self):
+        for overrides in ({"start": 700}, {"start": 20, "end": 10}, {"end": 601}):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
-                crf_search.select_samples(100, sampling(**overrides))
+                self.plan(**overrides)
 
 
-class SummaryTests(unittest.TestCase):
-    def test_bitrate_is_duration_weighted_and_excludes_stress_scenes(self):
-        samples = [result(1, 1_000_000, {"I": 16, "P": 17, "B": 18}),
-                   result(3, 6_000_000, {"I": 18, "P": 19, "B": 20}, start=5),
-                   result(10, 100_000_000, {"I": 30}, kind="stress", start=30)]
-        summary = crf_search.summarize_trial(18, samples, policy())
-        self.assertEqual(summary["crf"], 18)
-        self.assertAlmostEqual(summary["bitrate_mbps"], 14.0)
-        self.assertAlmostEqual(summary["qp95"], 19.9)
-        self.assertEqual(summary["stress_qp"], 30)
-        self.assertFalse(summary["qp_pass"])
-
-    def test_missing_frame_types_are_valid(self):
-        summary = crf_search.summarize_trial(
-            18, [result(1, 500_000, {"I": 18})], policy())
-        self.assertEqual(summary["qp95"], 18)
-        self.assertTrue(summary["qp_pass"])
-
-    def test_emergency_bitrate_does_not_override_qp_priority(self):
-        summary = crf_search.summarize_trial(
-            18, [result(1, 5_000_000, {"I": 18})], policy())
-        self.assertEqual(summary["bitrate_mbps"], 40)
-        self.assertTrue(summary["qp_pass"])
-
-    def test_stress_scene_can_fail_an_otherwise_passing_trial(self):
-        summary = crf_search.summarize_trial(18, [
-            result(1, 500_000, {"I": 18}),
-            result(1, 500_000, {"I": 20}, kind="stress"),
-        ], policy())
-        self.assertEqual(summary["qp95"], 18)
-        self.assertEqual(summary["worst_qp"], 18)
-        self.assertEqual(summary["stress_qp"], 20)
-        self.assertFalse(summary["qp_pass"])
-
-    def test_incomplete_metrics_cannot_produce_recommendations(self):
-        for item in (result(0, 1000, {"I": 18}), result(1, 0, {"I": 18}),
-                     result(1, 1000, {}), result(1, 1000, {"I": math.nan})):
-            with self.subTest(item=item), self.assertRaises(ValueError):
-                crf_search.summarize_trial(18, [item], policy())
+def metrics(duration, video_bytes, qps, counts):
+    return {"duration": duration, "video_bytes": video_bytes,
+            "qp": qps, "frame_counts": counts, "frames": sum(counts.values())}
 
 
-class SearchTests(unittest.TestCase):
-    def run_search(self, qp_function, *, max_trials=12, **policy_overrides):
-        observations = []
-        search_policy = policy(**policy_overrides)
+class AverageTests(unittest.TestCase):
+    def test_qp_uses_only_b_frame_counts_and_bitrate_weights_duration(self):
+        first = metrics(5, 1_000_000, {"I": 10.0, "P": 20.0, "B": 30.0}, {"I": 1, "P": 3, "B": 6})
+        second = metrics(10, 4_000_000, {"I": 40.0, "P": 45.0, "B": 20.0}, {"I": 1, "P": 27, "B": 2})
+        row = crf_search.summarize_trial(14, [first, second])
+        self.assertEqual(row["samples"][0]["average_qp"], 30)
+        self.assertEqual(row["samples"][0]["b_frames"], 6)
+        self.assertEqual(row["samples"][1]["average_qp"], 20)
+        self.assertEqual(row["average_qp"], 27.5)
+        self.assertEqual(row["b_frames"], 8)
+        self.assertAlmostEqual(row["average_bitrate_mbps"], 40 / 15)
+        self.assertEqual((row["frames"], row["duration_seconds"], row["sample_count"]), (40, 15, 2))
+        self.assertNotIn("qp95", row)
+        self.assertNotIn("recommended_crf", row)
 
-        def evaluate(crf):
-            observations.append(crf)
-            return crf_search.summarize_trial(crf, [
-                result(1, round(10_000_000 * 2 ** (-crf / 6)), {"I": qp_function(crf)}),
-            ], search_policy)
+    def test_clip_without_b_frames_contributes_to_bitrate_but_not_qp(self):
+        first = metrics(5, 1_000_000, {"I": 10.0, "P": 20.0, "B": 30.0}, {"I": 1, "P": 3, "B": 6})
+        second = metrics(10, 4_000_000, {"I": 40.0, "P": 45.0}, {"I": 1, "P": 29})
+        row = crf_search.summarize_trial(14, [first, second])
+        self.assertIsNone(row["samples"][1]["average_qp"])
+        self.assertEqual(row["samples"][1]["b_frames"], 0)
+        self.assertEqual(row["samples"][1]["average_bitrate_mbps"], 3.2)
+        self.assertEqual(row["average_qp"], 30)
+        self.assertEqual(row["b_frames"], 6)
+        self.assertEqual(row["frames"], 40)
+        self.assertAlmostEqual(row["average_bitrate_mbps"], 40 / 15)
 
-        rows, summary = crf_search.auto_search(evaluate, search_policy, {
-            "min_crf": 14.0, "max_crf": 23.0,
-            "precision": 0.1, "max_trials": max_trials,
-        })
-        self.assertEqual(len(observations), len(set(observations)))
-        self.assertLessEqual(len(observations), max_trials)
-        self.assertTrue(all(14 <= crf <= 23 for crf in observations))
-        self.assertEqual([row["crf"] for row in rows], sorted(observations))
-        passing = [row["crf"] for row in rows if row["qp_pass"]]
-        self.assertEqual(summary["best_tested_crf"], max(passing, default=None))
-        self.assertEqual(summary["comparison_complete"], len(rows) >= 2)
-        if summary["recommended_crf"] is not None:
-            self.assertIn(summary["recommended_crf"], passing)
-            self.assertTrue(summary["converged"])
-            self.assertTrue(summary["comparison_complete"])
-            self.assertTrue(summary["verified"])
-        else:
-            self.assertFalse(summary["verified"])
-        self.assertEqual(summary["trials"], len(observations))
-        return rows, summary
+    def test_trial_without_b_frames_has_no_qp_but_still_reports_bitrate(self):
+        first = metrics(5, 1_000_000, {"I": 10.0, "P": 20.0}, {"I": 1, "P": 9})
+        second = metrics(10, 4_000_000, {"I": 40.0}, {"I": 30})
+        row = crf_search.summarize_trial(14, [first, second])
+        self.assertIsNone(row["average_qp"])
+        self.assertEqual(row["b_frames"], 0)
+        self.assertTrue(all(sample["average_qp"] is None for sample in row["samples"]))
+        self.assertEqual((row["frames"], row["duration_seconds"], row["sample_count"]), (40, 15, 2))
+        self.assertAlmostEqual(row["average_bitrate_mbps"], 40 / 15)
 
-    def test_brackets_and_refines_fractional_crf_threshold(self):
-        rows, summary = self.run_search(lambda crf: crf + 1.67)
-        self.assertEqual(summary["recommended_crf"], 17.8)
-        self.assertEqual(summary["reason"], "precision_reached")
-        self.assertTrue(any(row["crf"] == 17.9 and not row["qp_pass"] for row in rows))
+    def test_bad_or_incomplete_frame_metrics_are_rejected(self):
+        good = metrics(5, 1000, {"I": 15.0, "P": 20.0}, {"I": 1, "P": 9})
+        for change in ({"duration": 0}, {"video_bytes": 0}, {"frames": 11},
+                       {"frame_counts": {"I": 1}}, {"qp": {"I": 15}},
+                       {"qp": {"I": float("nan"), "P": 20}}, {"frame_counts": {"I": -1, "P": 11}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                crf_search.sample_metrics({**good, **change})
+        with self.assertRaises(ValueError):
+            crf_search.summarize_trial(14, [])
 
-    def test_finds_upper_bound_when_every_trial_passes(self):
-        _, summary = self.run_search(lambda crf: 10)
-        self.assertEqual(summary["recommended_crf"], 23)
-        self.assertEqual(summary["reason"], "upper_bound_passes")
+    def test_plot_uses_average_qp_on_x_and_average_mbps_on_y_and_labels_crfs(self):
+        report = {"state": "complete", "source": {"path": "movie.mkv"}, "codecs": {
+            "x264": {"rows": [{"crf": 14, "average_qp": 17, "average_bitrate_mbps": 12},
+                               {"crf": 15, "average_qp": 18, "average_bitrate_mbps": 9}]},
+            "x265": {"rows": [{"crf": 14, "average_qp": 19, "average_bitrate_mbps": 8}]},
+        }}
+        figure = make_figure(report)
+        try:
+            axes = figure.axes[0]
+            self.assertEqual(axes.get_xlabel(), "Average B-frame QP (weighted by B-frame count)")
+            self.assertIn("bitrate", axes.get_ylabel())
+            self.assertEqual(list(axes.lines[0].get_xdata()), [17, 18])
+            self.assertEqual(list(axes.lines[0].get_ydata()), [12, 9])
+            self.assertEqual([line.get_label() for line in axes.lines], ["x264", "x265"])
+            self.assertEqual([text.get_text() for text in axes.texts], ["CRF 14", "CRF 15", "CRF 14"])
+        finally:
+            figure.clear()
 
-    def test_finds_passing_lower_bound(self):
-        _, summary = self.run_search(lambda crf: crf + 5.5)
-        self.assertEqual(summary["recommended_crf"], 14)
-        self.assertEqual(summary["reason"], "precision_reached")
-
-    def test_no_feasible_crf_is_reported_without_inventing_one(self):
-        rows, summary = self.run_search(lambda crf: 30)
-        self.assertIsNone(summary["recommended_crf"])
-        self.assertFalse(summary["verified"])
-        self.assertEqual(min(row["crf"] for row in rows), 14)
-        self.assertEqual(summary["reason"], "no_passing_crf_in_bounds")
-
-    def test_single_trial_yields_only_a_provisional_candidate(self):
-        _, summary = self.run_search(lambda crf: crf + 1, max_trials=1)
-        self.assertIsNone(summary["recommended_crf"])
-        self.assertEqual(summary["best_tested_crf"], 17.5)
-        self.assertFalse(summary["comparison_complete"])
-        self.assertFalse(summary["converged"])
-        self.assertFalse(summary["verified"])
-        self.assertEqual(summary["reason"], "trial_limit")
-
-    def test_nonmonotonic_observations_stop_refinement(self):
-        rows = [crf_search.summarize_trial(crf, [result(1, 1_000_000, {"I": qp})], policy())
-                for crf, qp in ((16.5, 25), (17.5, 15), (18.5, 15))]
-        candidate, summary = crf_search.next_trial(rows, policy(), {
-            "min_crf": 14.0, "max_crf": 23.0, "precision": 0.1, "max_trials": 12,
-        })
-        self.assertIsNone(candidate)
-        self.assertEqual(summary["reason"], "nonmonotonic_observations")
-        self.assertIsNone(summary["recommended_crf"])
-        self.assertEqual(summary["best_tested_crf"], 18.5)
-        self.assertFalse(summary["verified"])
-
-    def test_upper_bound_need_not_be_a_precision_multiple(self):
-        def evaluate(crf):
-            return {"crf": crf, "qp95": 10, "qp_pass": True}
-
-        rows, summary = crf_search.auto_search(evaluate, policy(), {
-            "min_crf": 14.0, "max_crf": 20.03, "precision": 0.1, "max_trials": 12,
-        })
-        self.assertEqual(summary["recommended_crf"], 20.03)
-        self.assertIn(20.03, [row["crf"] for row in rows])
-        self.assertEqual(summary["reason"], "upper_bound_passes")
-
-    def test_non_round_lower_bound_is_sampled_once_and_search_terminates(self):
-        low = 25.118768723996514
-        high = 26.945218159464417
-        threshold = 25.32228644328755
-        observations = []
-
-        def evaluate(crf):
-            observations.append(crf)
-            return {"crf": crf, "qp95": crf, "qp_pass": crf <= threshold}
-
-        rows, summary = crf_search.auto_search(
-            evaluate, policy(initial_crf=(low + high) / 2, qp_target=threshold),
-            {"min_crf": low, "max_crf": high, "precision": 0.5, "max_trials": 12},
-        )
-        self.assertEqual(observations.count(low), 1)
-        self.assertEqual(len(observations), len(set(observations)))
-        self.assertEqual(summary["recommended_crf"], low)
-        self.assertEqual(summary["reason"], "precision_reached")
-        self.assertTrue(all(low <= row["crf"] <= high for row in rows))
-
-    def test_incremental_trials_finish_with_a_measured_passing_crf(self):
-        rows = []
-        search = {"min_crf": 14.0, "max_crf": 23.0,
-                  "precision": 0.1, "max_trials": 12}
-        for _ in range(search["max_trials"] + 1):
-            crf, summary = crf_search.next_trial(rows, policy(), search)
-            if crf is None:
-                break
-            self.assertIsNone(summary)
-            self.assertNotIn(crf, [row["crf"] for row in rows])
-            rows.append(crf_search.summarize_trial(crf, [
-                result(1, 1_000_000, {"I": crf + 1.67}),
-            ], policy()))
-        else:
-            self.fail("Incremental search did not finish within its trial limit")
-        self.assertEqual(summary["recommended_crf"], 17.8)
-        self.assertEqual(summary["reason"], "precision_reached")
-        self.assertIn(17.8, [row["crf"] for row in rows if row["qp_pass"]])
+    def test_plot_omits_measurements_without_b_frame_qp(self):
+        report = {"state": "complete", "source": {"path": "movie.mkv"}, "codecs": {
+            "x264": {"rows": [{"crf": 14, "average_qp": 17, "average_bitrate_mbps": 12},
+                               {"crf": 15, "average_qp": None, "average_bitrate_mbps": 9},
+                               {"crf": 16, "average_qp": 19, "average_bitrate_mbps": 8}]},
+            "x265": {"rows": [{"crf": 14, "average_qp": None, "average_bitrate_mbps": 7}]},
+        }}
+        figure = make_figure(report)
+        try:
+            axes = figure.axes[0]
+            self.assertEqual(len(axes.lines), 1)
+            self.assertEqual(list(axes.lines[0].get_xdata()), [17, 19])
+            self.assertEqual(list(axes.lines[0].get_ydata()), [12, 8])
+            self.assertEqual([text.get_text() for text in axes.texts], ["CRF 14", "CRF 16"])
+        finally:
+            figure.clear()
 
 
-class RuntimePlanningTests(unittest.TestCase):
-    def test_sampling_identity_ignores_policy_but_tracks_encoding_budget_and_source(self):
-        signature = {
-            "source": {"path": "fixture.mkv", "size": 10, "mtime_ns": 1},
-            "versions": {"pyav": "test"}, "config": crf_search.load_config(),
-            "codecs": ["x264", "x265"], "crop": None, "backend_sha256": "test-backend",
-        }
-        signature["config"]["search"]["max_trials"] = 6
-        identity = crf_search.sampling_identity(signature)
-        changed_policy = copy.deepcopy(signature)
-        changed_policy["config"]["search"]["max_trials"] = 12
-        changed_policy["config"]["codecs"]["x264"]["qp_target"] = 19.4
-        self.assertEqual(crf_search.sampling_identity(changed_policy), identity)
-        self.assertEqual(crf_search.sampling_identity(identity), identity)
-
-        for path, value in (
-            (("config", "codecs", "x264", "params", "aq-strength"), "0.9"),
-            (("config", "runtime", "target_seconds"), 150.0),
-            (("source", "mtime_ns"), 2),
-        ):
-            with self.subTest(changed=path):
-                changed = copy.deepcopy(signature)
-                target = changed
-                for key in path[:-1]:
-                    target = target[key]
-                target[path[-1]] = value
-                self.assertNotEqual(crf_search.sampling_identity(changed), identity)
-
-    def test_sample_floor_respects_lookahead_and_requested_duration(self):
-        config = crf_search.load_config()
-        config["sampling"]["seconds"] = 6.0
-        info = {"fps": "24", "duration": 120.0}
-        self.assertEqual(crf_search.sample_floor(info, config, ["x264", "x265"]), 3.0)
-        config["codecs"]["x265"]["params"]["rc-lookahead"] = "120"
-        self.assertAlmostEqual(crf_search.sample_floor(info, config, ["x264", "x265"]), 131 / 24)
-        config["sampling"]["seconds"] = 2.0
-        self.assertEqual(crf_search.sample_floor(info, config, ["x264", "x265"]), 2.0)
-
-    def test_duration_calibration_uses_cost_of_both_codecs(self):
-        timings = [{"duration": 3.0, "wall_seconds": 3.0},
-                   {"duration": 3.0, "wall_seconds": 6.0}]
-        combined = crf_search.choose_sample_seconds(6, 3, timings, 10, 3, 450)
-        single = crf_search.choose_sample_seconds(6, 3, timings[:1], 10, 3, 450)
-        self.assertAlmostEqual(combined, 4.0)
-        self.assertEqual(single, 6.0)
-
-    def test_calibration_keeps_floor_when_target_is_too_small(self):
-        seconds = crf_search.choose_sample_seconds(
-            6, 3, [{"duration": 3.0, "wall_seconds": 30.0}], 10, 3, 1,
-        )
-        self.assertEqual(seconds, 3.0)
-
-    def test_expired_timeout_cannot_return_an_existing_cached_sample(self):
-        job = {"input": "fixture.mkv", "codec": "x264", "crf": 18.0,
-               "start": 0.0, "duration": 1.0, "video_index": 0,
-               "settings": {}, "crop": None}
-        source = {"path": "fixture.mkv", "size": 1, "mtime_ns": 1}
-        versions = {"pyav": "test"}
-        encoded = {"frames": 12, "duration": 1.0, "video_bytes": 1000, "qp": {"I": 15}}
-        with (tempfile.TemporaryDirectory(prefix="crf-expired-cache-") as directory,
-              mock.patch.object(crf_search, "run_process", return_value=json.dumps(encoded)) as worker):
+class WorkerCleanupTests(unittest.TestCase):
+    def test_interrupt_kills_and_reaps_worker_without_caching_partial_metrics(self):
+        process = mock.Mock()
+        process.communicate.side_effect = [KeyboardInterrupt, ("", None)]
+        job = {"codec": "x264", "crf": 14, "start": 0, "duration": 5}
+        with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            first = crf_search.run_sample(job, source, versions, output, True, timeout=10)
-            self.assertFalse(first["cached"])
-            cached = crf_search.run_sample(job, source, versions, output, True, timeout=10)
-            self.assertTrue(cached["cached"])
-            for expired in (0.0, -1.0):
-                with self.subTest(timeout=expired), self.assertRaises(crf_search.BudgetExpired):
-                    crf_search.run_sample(job, source, versions, output, True, timeout=expired)
-            worker.assert_called_once()
+            with mock.patch.object(crf_search.subprocess, "Popen", return_value=process):
+                with self.assertRaises(KeyboardInterrupt):
+                    crf_search.run_sample(job, {}, {}, output, True)
+            process.kill.assert_called_once()
+            self.assertEqual(process.communicate.call_count, 2)
+            self.assertFalse((output / "cache").exists())
 
 
-class SweepArgumentTests(unittest.TestCase):
-    def test_fractional_range_includes_exact_endpoint(self):
-        self.assertEqual(crf_search.parse_crf_range("17:17.3:0.1"), [17, 17.1, 17.2, 17.3])
-
-    def test_range_does_not_invent_off_grid_endpoint(self):
-        self.assertEqual(crf_search.parse_crf_range("17:17.25:0.1"), [17, 17.1, 17.2])
-
-    def test_invalid_ranges_are_rejected(self):
-        for value in ("18:17:.1", "17:18:0", "nan:18:1", "17:inf:1", "0:51:.001", "17:18"):
-            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                crf_search.parse_crf_range(value)
-
-
-class CropResolutionTests(unittest.TestCase):
-    def test_manual_and_disabled_crop_do_not_run_detection(self):
-        for requested, expected, dimensions in (
-            ("96:64:16:16", "96:64:16:16", (96, 64)),
-            ("110:80:9:7", "110:80:9:7", (110, 80)),
-            (None, None, (128, 96)),
-        ):
-            with self.subTest(crop=requested):
-                config = crf_search.load_config()
-                config["video"]["crop"] = requested
-                with mock.patch.object(crf_search, "detect_crop") as detector:
-                    resolved = crf_search.resolve_crop(
-                        Path("unused.mkv"), {"width": 128, "height": 96}, config, [],
-                    )
-                detector.assert_not_called()
-                self.assertEqual(resolved["crop"], expected)
-                self.assertEqual((resolved["width"], resolved["height"]), dimensions)
-
-    def test_manual_crop_requires_even_size_but_does_not_change_it(self):
-        for requested in ("95:64:16:16", "96:63:16:16"):
-            with self.subTest(crop=requested):
-                config = crf_search.load_config()
-                config["video"]["crop"] = requested
-                with self.assertRaisesRegex(ValueError, "even"):
-                    crf_search.resolve_crop(
-                        Path("unused.mkv"), {"width": 128, "height": 96}, config, [],
-                    )
-
-    def test_automatic_resolution_uses_detected_rectangle(self):
-        config = crf_search.load_config()
-        self.assertEqual(config["video"]["crop"], "auto")
-        samples = [{"kind": "representative", "start": 0.0, "duration": 1.0}]
-        detected = {"mode": "auto", "crop": "96:64:16:16", "width": 96,
-                    "height": 64, "reason": "detected black borders"}
-        with mock.patch.object(crf_search, "detect_crop", return_value=detected) as detector:
-            resolved = crf_search.resolve_crop(
-                Path("unused.mkv"), {"width": 128, "height": 96}, config, samples,
-            )
-        detector.assert_called_once()
-        self.assertEqual(resolved["crop"], "96:64:16:16")
-        self.assertEqual((resolved["width"], resolved["height"]), (96, 64))
-
-
-class PyAVIntegrationTests(unittest.TestCase):
+class SweepIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="crf-search-tests-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="crf-sweep-tests-")
         cls.directory = Path(cls.temporary.name)
         cls.source = cls.directory / "video-and-audio.mkv"
         cls.video_only = cls.directory / "video-only.mkv"
@@ -457,406 +235,145 @@ class PyAVIntegrationTests(unittest.TestCase):
         make_media(cls.bordered, borders=True)
         cls.config = cls.directory / "config.json"
         cls.config.write_text(json.dumps({
-            "sampling": {"count": 1, "seconds": 1},
+            "sampling": {"count": 2, "min_seconds": 0.3, "max_seconds": 0.4, "seed": 123},
             "codecs": {
-                "x264": {"preset": "ultrafast", "params": {
-                    "threads": 1, "bframes": 2, "rc-lookahead": 4,
-                    "aq-mode": 1, "deblock": "-3,-3",
-                }},
-                "x265": {"preset": "ultrafast", "params": {
-                    "pools": "none", "frame-threads": 1, "bframes": 2,
-                    "rc-lookahead": 4, "deblock": "-3,-3",
-                }},
+                "x264": {"preset": "ultrafast", "params": {"threads": 1, "bframes": 2,
+                                                           "b-adapt": 0, "rc-lookahead": 4}},
+                "x265": {"preset": "ultrafast", "params": {"pools": "none", "frame-threads": 1,
+                                                           "bframes": 2, "b-adapt": 0, "rc-lookahead": 4}},
             },
-        }), encoding="utf-8")
+        }))
 
     @classmethod
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def cli(self, source, output, *extra, automatic=False):
-        return subprocess.run([
-            sys.executable, str(ROOT / "scripts" / "crf_search.py"), str(source),
-            "--config", str(self.config), "--output-dir", str(output),
-            *([] if automatic else ["--crf-values", "16,23"]), *extra,
-        ], cwd=ROOT, text=True, capture_output=True, timeout=60)
+    def cli(self, source, output, *extra):
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / "crf_search.py"), str(source),
+                               "--config", str(self.config), "--output-dir", str(output), *extra],
+                              cwd=ROOT, text=True, capture_output=True, timeout=60)
 
-    def runtime_config(self, name, *, seconds, count):
-        config = json.loads(self.config.read_text(encoding="utf-8"))
-        config["sampling"].update(seconds=seconds, count=count)
-        path = self.directory / f"{name}-config.json"
-        path.write_text(json.dumps(config), encoding="utf-8")
-        return path
-
-    def mocked_probe(self, duration):
-        def probe(operation, *_args, **kwargs):
-            self.assertGreater(kwargs["timeout"], 0)
-            if operation == "inspect":
-                return {"width": 96, "height": 64, "duration": duration, "fps": "12"}
-            self.assertEqual(operation, "crop")
-            return {"mode": "auto", "crop": None, "width": 96, "height": 64,
-                    "reason": "Full frame fixture"}
-        return probe
-
-    @staticmethod
-    def mocked_sample(job):
-        return {"duration": job["duration"], "video_bytes": 12_345,
-                "frames": max(1, round(job["duration"] * 12)), "qp": {"I": 15},
-                "width": 96, "height": 64, "cached": False, "cache_key": "mock",
-                "wall_seconds": 1.0, "encoder_options": {}}
-
-    def test_both_codecs_sweep_reports_settings_and_resumes_without_encoding(self):
+    def test_both_encoders_complete_exactly_five_crfs_and_write_table_and_figures(self):
         output = self.directory / "both-codecs"
-        completed = self.cli(self.source, output, "--codec", "both")
+        completed = self.cli(self.source, output)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertLess(completed.stderr.index("profile=high"), completed.stderr.index("x264 CRF 14:"))
+        self.assertLess(completed.stderr.index("profile=main10"), completed.stderr.index("x264 CRF 14:"))
+        report = json.loads((output / "results.json").read_text())
         self.assertEqual(report["state"], "complete")
-        self.assertIsNone(report["crop_detection"]["crop"])
-        self.assertEqual(set(report["codecs"]), {"x264", "x265"})
-        for codec in ("x264", "x265"):
-            with self.subTest(codec=codec):
-                self.assertEqual(report["config"]["codecs"][codec]["preset"], "ultrafast")
-                self.assertEqual(report["config"]["codecs"][codec]["params"]["deblock"], "-3,-3")
-                analysis = report["codecs"][codec]
-                self.assertEqual([row["crf"] for row in analysis["rows"]], [16, 23])
-                for row in analysis["rows"]:
-                    self.assertIsInstance(row["bitrate_mbps"], (int, float))
-                    self.assertGreater(row["bitrate_mbps"], 0)
-                    self.assertTrue(math.isfinite(row["qp95"]))
-                    self.assertEqual(row["measurement"], "sample encode")
-                    self.assertEqual(len(row["samples"]), 1)
-                    sample = row["samples"][0]
-                    self.assertEqual(sample["frames"], 12)
-                    self.assertAlmostEqual(sample["duration"], 1, places=2)
-                    self.assertAlmostEqual(row["bitrate_mbps"],
-                                           sample["video_bytes"] * 8 / sample["duration"] / 1e6)
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["qp_frame_type"], "B")
+        self.assertEqual(report["crf_values"], [14, 15, 16, 17, 18])
+        for codec, analysis in report["codecs"].items():
+            self.assertEqual([row["crf"] for row in analysis["rows"]], [14, 15, 16, 17, 18])
+            for row in analysis["rows"]:
+                self.assertEqual(row["sample_count"], 2)
+                self.assertEqual([sample["sample"] for sample in row["samples"]], report["sample_plan"])
+                b_frames = sum(sample["frame_counts"].get("B", 0) for sample in row["samples"])
+                self.assertGreater(b_frames, 0)
+                self.assertEqual(row["b_frames"], b_frames)
+                total_qp = sum(sample["qp"].get("B", 0) * sample["frame_counts"].get("B", 0)
+                               for sample in row["samples"])
+                self.assertAlmostEqual(row["average_qp"], total_qp / b_frames)
+                self.assertAlmostEqual(row["average_bitrate_mbps"], row["video_bytes"] * 8 / row["duration_seconds"] / 1e6)
+                for sample in row["samples"]:
+                    self.assertEqual(sample["average_qp"], sample["qp"].get("B"))
+                    self.assertEqual(sample["b_frames"], sample["frame_counts"].get("B", 0))
+                    self.assertEqual(float(sample["encoder_options"]["crf"]), row["crf"])
+                    self.assertEqual(sample["encoder_options"]["preset"], "ultrafast")
                     self.assertFalse(sample["cached"])
-                    options = sample["encoder_options"]
-                    self.assertEqual(options["preset"], "ultrafast")
-                    self.assertEqual(float(options["crf"]), row["crf"])
-                    self.assertIn("deblock=-3,-3", options[f"{codec}-params"])
-        with (output / "summary.csv").open(encoding="utf-8", newline="") as handle:
-            table = list(csv.DictReader(handle))
-        self.assertEqual(len(table), 4)
-        self.assertEqual({row["codec"] for row in table}, {"x264", "x265"})
-        self.assertTrue(all(row["recommended"] == "False" for row in table))
-        for analysis in report["codecs"].values():
-            self.assertIsNone(analysis["search"]["recommended_crf"])
-            self.assertFalse(analysis["search"]["verified"])
-            self.assertTrue(analysis["search"]["comparison_complete"])
-        log_times = {path: path.stat().st_mtime_ns for path in (output / "logs").glob("*.log")}
-        self.assertEqual(len(log_times), 4)
-        with (mock.patch.object(crf_search, "run_process",
-                                side_effect=AssertionError("Cached samples must not start workers")),
+        with (output / "summary.csv").open() as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 10)
+        self.assertNotIn("recommended", rows[0])
+        self.assertTrue(all(int(row["b_frames"]) > 0 for row in rows))
+        with Image.open(output / "qp-bitrate.png") as figure:
+            self.assertEqual(figure.format, "PNG")
+            self.assertGreater(figure.width, 1000)
+            self.assertGreater(figure.height, 600)
+        svg = (output / "qp-bitrate.svg").read_text()
+        self.assertIn("Average B-frame QP", svg)
+        self.assertIn("Average video bitrate", svg)
+        self.assertIn("CRF 18", svg)
+        with (mock.patch.object(crf_search.subprocess, "Popen", side_effect=AssertionError("Cached sweep must not encode")),
               mock.patch.object(crf_search.CONSOLE, "quiet", True)):
-            self.assertEqual(crf_search.main([
-                str(self.source), "--config", str(self.config), "--output-dir", str(output),
-                "--codec", "both", "--crf-values", "16,23",
-            ]), 0)
-        resumed = json.loads((output / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(crf_search.main([str(self.source), "--config", str(self.config),
+                                              "--output-dir", str(output)]), 0)
+        resumed = json.loads((output / "results.json").read_text())
+        self.assertEqual(resumed["sample_plan"], report["sample_plan"])
         self.assertTrue(all(sample["cached"] for analysis in resumed["codecs"].values()
                             for row in analysis["rows"] for sample in row["samples"]))
-        self.assertEqual(log_times, {path: path.stat().st_mtime_ns for path in log_times})
 
-    def test_audio_is_excluded_from_video_measurement(self):
+    def test_audio_is_excluded_and_exact_manual_crop_survives_all_crfs(self):
         reports = []
         for source in (self.source, self.video_only):
-            output = self.directory / (source.stem + "-comparison")
-            completed = self.cli(source, output, "--codec", "x264", "--crf-values", "18")
+            output = self.directory / (source.stem + "-video-comparison")
+            completed = self.cli(source, output, "--codec", "x264", "--crop", "94:62:1:1")
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-            reports.append(json.loads((output / "results.json").read_text(encoding="utf-8")))
-        rows = [report["codecs"]["x264"]["rows"][0] for report in reports]
-        self.assertEqual(rows[0]["bitrate_mbps"], rows[1]["bitrate_mbps"])
-        self.assertEqual(rows[0]["qp95"], rows[1]["qp95"])
-        self.assertEqual(rows[0]["samples"][0]["frames"], 12)
+            reports.append(json.loads((output / "results.json").read_text()))
+        for first, second in zip(reports[0]["codecs"]["x264"]["rows"], reports[1]["codecs"]["x264"]["rows"]):
+            self.assertEqual(first["average_qp"], second["average_qp"])
+            self.assertEqual(first["average_bitrate_mbps"], second["average_bitrate_mbps"])
+            self.assertTrue(all((sample["width"], sample["height"]) == (94, 62) for sample in first["samples"]))
 
-    def test_real_automatic_search_compares_native_encodes_before_recommending(self):
-        output = self.directory / "native-automatic-search"
-        completed = self.cli(self.source, output, "--codec", "both", automatic=True)
+    def test_sweep_without_b_frames_reports_missing_qp_and_preserves_bitrate(self):
+        config = json.loads(self.config.read_text())
+        config["codecs"]["x264"]["params"]["bframes"] = 0
+        no_b_config = self.directory / "no-b-config.json"
+        no_b_config.write_text(json.dumps(config))
+        output = self.directory / "no-b-frames"
+        completed = self.cli(self.source, output, "--codec", "x264", "--config", str(no_b_config))
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        for codec in ("x264", "x265"):
-            analysis = report["codecs"][codec]
-            rows = analysis["rows"]
-            self.assertGreaterEqual(len({row["crf"] for row in rows}), 2)
-            passing = [row["crf"] for row in rows if row["qp_pass"]]
-            self.assertEqual(analysis["search"]["best_tested_crf"], max(passing, default=None))
-            self.assertTrue(analysis["search"]["comparison_complete"])
-            for row in rows:
-                self.assertGreaterEqual(row["crf"], report["config"]["search"]["min_crf"])
-                self.assertLessEqual(row["crf"], report["config"]["search"]["max_crf"])
-                self.assertEqual(float(row["samples"][0]["encoder_options"]["crf"]), row["crf"])
-                self.assertFalse(row["samples"][0]["cached"])
-            if analysis["search"]["recommended_crf"] is not None:
-                self.assertEqual(analysis["search"]["recommended_crf"], max(passing))
-                self.assertTrue(analysis["search"]["converged"])
-                self.assertTrue(analysis["search"]["verified"])
-            else:
-                self.assertFalse(analysis["search"]["verified"])
+        self.assertIn("N/A (no B-frames)", completed.stderr)
+        self.assertIn("Average B-frame QP", completed.stderr)
+        report = json.loads((output / "results.json").read_text())
+        self.assertEqual(report["state"], "complete")
+        self.assertEqual(len(report["codecs"]["x264"]["rows"]), 5)
+        for row in report["codecs"]["x264"]["rows"]:
+            self.assertIsNone(row["average_qp"])
+            self.assertEqual(row["b_frames"], 0)
+            self.assertGreater(row["average_bitrate_mbps"], 0)
+            self.assertGreater(row["frames"], 0)
+        with (output / "summary.csv").open() as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertTrue(all(row["average_qp"] == "" and row["b_frames"] == "0" for row in rows))
+        svg = (output / "qp-bitrate.svg").read_text()
+        self.assertIn("No B-frames in completed measurements", svg)
+        self.assertNotIn("<!-- CRF 14 -->", svg)
 
-    def test_audio_only_source_fails_clearly(self):
-        completed = self.cli(self.audio_only, self.directory / "no-video", "--codec", "x264")
+    def test_crop_is_detected_once_and_shared_by_every_crf(self):
+        output = self.directory / "cropped"
+        with (mock.patch.object(crf_search, "detect_crop", wraps=crf_search.detect_crop) as detector,
+              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
+            self.assertEqual(crf_search.main([str(self.bordered), "--config", str(self.config),
+                                              "--codec", "x264", "--output-dir", str(output)]), 0)
+        detector.assert_called_once()
+        report = json.loads((output / "results.json").read_text())
+        self.assertEqual(report["crop_detection"]["crop"], "96:64:16:16")
+        for row in report["codecs"]["x264"]["rows"]:
+            self.assertTrue(all((sample["width"], sample["height"]) == (96, 64) for sample in row["samples"]))
+
+    def test_partial_sample_set_is_not_reported_as_a_complete_average(self):
+        output = self.directory / "interrupted"
+        encoded = metrics(0.3, 1200, {"I": 18, "P": 20}, {"I": 1, "P": 3})
+        with (mock.patch.object(crf_search, "run_sample", side_effect=[encoded, KeyboardInterrupt]),
+              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
+            code = crf_search.main([str(self.source), "--config", str(self.config),
+                                   "--codec", "x264", "--output-dir", str(output)])
+        self.assertEqual(code, 130)
+        report = json.loads((output / "results.json").read_text())
+        self.assertEqual(report["state"], "interrupted")
+        self.assertEqual(report["codecs"]["x264"]["rows"], [])
+        self.assertTrue((output / "qp-bitrate.png").exists())
+
+    def test_audio_only_and_too_many_samples_fail_clearly(self):
+        completed = self.cli(self.audio_only, self.directory / "no-video")
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("video", completed.stderr.lower())
         self.assertNotIn("Traceback", completed.stderr)
-
-    def test_automatic_crop_is_detected_once_and_shared_by_all_trials(self):
-        output = self.directory / "auto-cropped"
-        with (mock.patch.object(crf_search, "run_probe", wraps=crf_search.run_probe) as probe,
-              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
-            exit_code = crf_search.main([
-                str(self.bordered), "--config", str(self.config), "--output-dir", str(output),
-                "--codec", "both", "--crf-values", "16,23",
-            ])
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(sum(call.args[0] == "crop" for call in probe.call_args_list), 1)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["state"], "complete")
-        self.assertEqual(report["config"]["video"]["crop"], "auto")
-        self.assertEqual(report["crop_detection"]["mode"], "auto")
-        self.assertEqual(report["crop_detection"]["crop"], "96:64:16:16")
-        samples = [sample for analysis in report["codecs"].values()
-                   for row in analysis["rows"] for sample in row["samples"]]
-        self.assertEqual(len(samples), 4)
-        for sample in samples:
-            self.assertEqual((sample["width"], sample["height"]), (96, 64))
-            cache = json.loads((output / "cache" / f"{sample['cache_key']}.json").read_text(encoding="utf-8"))
-            self.assertEqual(cache["fingerprint"]["job"]["crop"], "96:64:16:16")
-
-    def test_no_crop_preserves_frame_and_auto_crop_invalidates_its_cache(self):
-        output = self.directory / "crop-cache-invalidation"
-        uncropped = self.cli(self.bordered, output, "--codec", "x264", "--crf-values", "18", "--no-crop")
-        self.assertEqual(uncropped.returncode, 0, uncropped.stdout + uncropped.stderr)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        original = report["codecs"]["x264"]["rows"][0]["samples"][0]
-        self.assertIsNone(report["crop_detection"]["crop"])
-        self.assertEqual((original["width"], original["height"]), (128, 96))
-
-        cropped = self.cli(self.bordered, output, "--codec", "x264", "--crf-values", "18")
-        self.assertEqual(cropped.returncode, 0, cropped.stdout + cropped.stderr)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        updated = report["codecs"]["x264"]["rows"][0]["samples"][0]
-        self.assertEqual(report["crop_detection"]["crop"], "96:64:16:16")
-        self.assertEqual((updated["width"], updated["height"]), (96, 64))
-        self.assertFalse(updated["cached"])
-        self.assertNotEqual(original["cache_key"], updated["cache_key"])
-
-    def test_calibration_freezes_one_sample_plan_for_both_codecs(self):
-        config = self.runtime_config("calibration-plan", seconds=6, count=2)
-        output = self.directory / "calibration-plan"
-        jobs = []
-
-        def encode(job, *_args, **kwargs):
-            self.assertGreater(kwargs["timeout"], 0)
-            jobs.append(job)
-            return self.mocked_sample(job)
-
-        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(120)),
-              mock.patch.object(crf_search, "run_sample", side_effect=encode),
-              mock.patch.object(crf_search, "choose_sample_seconds", return_value=4.0) as choose,
-              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
-            exit_code = crf_search.main([
-                str(self.source), "--config", str(config), "--output-dir", str(output),
-                "--codec", "both", "--crf-values", "16",
-            ])
-        self.assertEqual(exit_code, 0)
-        choose.assert_called_once()
-        self.assertEqual([job["codec"] for job in jobs[:2]], ["x264", "x265"])
-        self.assertEqual([job["duration"] for job in jobs[:2]], [3.0, 3.0])
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["state"], "complete")
-        self.assertEqual(len(report["sample_plan"]), 2)
-        self.assertTrue(all(sample["duration"] == 4 for sample in report["sample_plan"]))
-        for analysis in report["codecs"].values():
-            self.assertEqual(len(analysis["rows"]), 1)
-            samples = analysis["rows"][0]["samples"]
-            self.assertEqual([sample["sample"] for sample in samples], report["sample_plan"])
-            self.assertEqual([sample["duration"] for sample in samples], [4.0, 4.0])
-
-    def test_legacy_calibrated_plan_survives_policy_changes_without_recalibration(self):
-        config = self.runtime_config("calibration-resume", seconds=6, count=2)
-        config_data = json.loads(config.read_text(encoding="utf-8"))
-        config_data["search"] = {"max_trials": 6}
-        config.write_text(json.dumps(config_data), encoding="utf-8")
-        output = self.directory / "calibration-resume"
-        jobs = []
-        argv = [str(self.source), "--config", str(config), "--output-dir", str(output),
-                "--codec", "both", "--crf-values", "16"]
-
-        def encode(job, *_args, **_kwargs):
-            jobs.append(job)
-            return self.mocked_sample(job)
-
-        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(120)),
-              mock.patch.object(crf_search, "run_sample", side_effect=encode),
-              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
-            with mock.patch.object(crf_search, "choose_sample_seconds", return_value=4.0) as choose:
-                self.assertEqual(crf_search.main(argv), 0)
-            choose.assert_called_once()
-            self.assertEqual([job["duration"] for job in jobs[:2]], [3.0, 3.0])
-            original = json.loads((output / "results.json").read_text(encoding="utf-8"))
-            self.assertEqual(original["config"]["search"]["max_trials"], 6)
-            original_jobs = jobs[2:].copy()
-            # Earlier reports put the full config in the calibration signature.
-            original["sampling_calibration"]["signature"]["config"] = copy.deepcopy(original["config"])
-            (output / "results.json").write_text(json.dumps(original), encoding="utf-8")
-            config_data["search"]["max_trials"] = 12
-            config_data["codecs"]["x264"]["qp_target"] = 19.4
-            config.write_text(json.dumps(config_data), encoding="utf-8")
-            jobs.clear()
-            with mock.patch.object(crf_search, "choose_sample_seconds",
-                                   side_effect=AssertionError("A resumed plan must not be recalibrated")):
-                self.assertEqual(crf_search.main(argv), 0)
-        resumed = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(resumed["sample_plan"], original["sample_plan"])
-        self.assertEqual(resumed["sampling_calibration"]["seconds"], 4.0)
-        self.assertEqual(resumed["config"]["search"]["max_trials"], 12)
-        self.assertEqual(resumed["config"]["codecs"]["x264"]["qp_target"], 19.4)
-        self.assertEqual(jobs, original_jobs)
-        self.assertEqual(len(jobs), 4)
-        self.assertTrue(all(job["duration"] == 4.0 for job in jobs))
-        self.assertEqual({job["codec"] for job in jobs}, {"x264", "x265"})
-        for analysis in resumed["codecs"].values():
-            self.assertEqual(len(analysis["rows"]), 1)
-            self.assertEqual([sample["sample"] for sample in analysis["rows"][0]["samples"]],
-                             original["sample_plan"])
-
-    def test_user_qp_rows_trigger_comparison_trials_after_target_with_hard_time_remaining(self):
-        config = self.runtime_config("comparison-reservation", seconds=0.25, count=1)
-        output = self.directory / "comparison-reservation"
-        clock = [100.0]
-        jobs = []
-        base_probe = self.mocked_probe(1)
-
-        def probe(operation, *args, **kwargs):
-            result = base_probe(operation, *args, **kwargs)
-            if operation == "inspect":
-                clock[0] += 179.0
-            return result
-
-        def encode(job, *_args, **kwargs):
-            self.assertGreater(kwargs["timeout"], 0)
-            jobs.append(job)
-            elapsed = 3.0
-            self.assertLessEqual(elapsed, kwargs["timeout"])
-            if len(jobs) > 1:
-                self.assertGreater(clock[0] - 100.0, 180.0)
-            clock[0] += elapsed
-            qp = job["crf"] + (1.806 if job["codec"] == "x264" else 4.49050595)
-            return {**self.mocked_sample(job), "wall_seconds": elapsed, "qp": {"I": qp}}
-
-        with (mock.patch.object(crf_search, "run_probe", side_effect=probe),
-              mock.patch.object(crf_search, "run_sample", side_effect=encode),
-              mock.patch.object(crf_search.time, "monotonic", side_effect=lambda: clock[0]),
-              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
-            self.assertEqual(crf_search.main([
-                str(self.source), "--config", str(config), "--output-dir", str(output),
-                "--codec", "both", "--target-seconds", "180", "--max-seconds", "300",
-            ]), 0)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["state"], "complete")
-        self.assertGreater(report["runtime"]["elapsed_seconds"], 180.0)
-        self.assertLessEqual(report["runtime"]["elapsed_seconds"], 300.0)
-        for codec, initial, initial_qp, expected in (
-            ("x264", 17.5, 19.306, 17.6),
-            ("x265", 18.5, 22.99050595, 16.0),
-        ):
-            analysis = report["codecs"][codec]
-            measured = [job["crf"] for job in jobs if job["codec"] == codec]
-            self.assertEqual(measured[0], initial)
-            if codec == "x264":
-                self.assertGreater(measured[1], initial)
-            else:
-                self.assertLess(measured[1], initial)
-            self.assertGreaterEqual(len(set(measured)), 3)
-            initial_row = next(row for row in analysis["rows"] if row["crf"] == initial)
-            self.assertAlmostEqual(initial_row["qp95"], initial_qp)
-            self.assertEqual(analysis["search"]["recommended_crf"], expected)
-            self.assertEqual(analysis["search"]["best_tested_crf"], expected)
-            self.assertTrue(analysis["search"]["comparison_complete"])
-            self.assertTrue(analysis["search"]["converged"])
-            self.assertTrue(analysis["search"]["verified"])
-
-    def test_deadline_discards_partial_trial_and_preserves_both_codec_candidates(self):
-        config = self.runtime_config("partial-deadline", seconds=0.25, count=2)
-        output = self.directory / "partial-deadline"
-        clock = [100.0]
-        jobs = []
-        display = io.StringIO()
-        console = type(crf_search.CONSOLE)(file=display, width=240, color_system=None)
-
-        def encode(job, *_args, **kwargs):
-            self.assertGreater(kwargs["timeout"], 0)
-            self.assertLessEqual(kwargs["timeout"], 10)
-            jobs.append(job)
-            if len(jobs) >= 6:
-                clock[0] += kwargs["timeout"]
-                raise crf_search.BudgetExpired("sample exceeded remaining time")
-            clock[0] += 1.0
-            return self.mocked_sample(job)
-
-        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(1)),
-              mock.patch.object(crf_search, "run_sample", side_effect=encode),
-              mock.patch.object(crf_search.time, "monotonic", side_effect=lambda: clock[0]),
-              mock.patch.object(crf_search, "CONSOLE", console)):
-            crf_search.main([
-                str(self.source), "--config", str(config), "--output-dir", str(output),
-                "--codec", "both", "--target-seconds", "8", "--max-seconds", "10",
-            ])
-        self.assertEqual([job["codec"] for job in jobs[:4]], ["x264", "x264", "x265", "x265"])
-        self.assertGreaterEqual(len(jobs), 6)
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["state"], "time_limit")
-        self.assertEqual(report["config"]["runtime"], {"target_seconds": 8.0, "max_seconds": 10.0})
-        self.assertEqual(set(report["codecs"]), {"x264", "x265"})
-        for codec, initial in (("x264", 17.5), ("x265", 18.5)):
-            analysis = report["codecs"][codec]
-            self.assertEqual([row["crf"] for row in analysis["rows"]], [initial])
-            self.assertEqual(len(analysis["rows"][0]["samples"]), 2)
-            self.assertIsNone(analysis["search"]["recommended_crf"])
-            self.assertEqual(analysis["search"]["best_tested_crf"], initial)
-            self.assertFalse(analysis["search"]["comparison_complete"])
-            self.assertFalse(analysis["search"]["verified"])
-        with (output / "summary.csv").open(encoding="utf-8", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(row["recommended"] == "False" for row in rows))
-        self.assertIn("provisional", display.getvalue().lower())
-
-    def test_settings_print_before_first_pilot_and_pilot_timeout_still_writes_report(self):
-        config = self.runtime_config("pilot-deadline", seconds=6, count=2)
-        output = self.directory / "pilot-deadline"
-        clock = [100.0]
-        display = io.StringIO()
-        console = type(crf_search.CONSOLE)(file=display, width=240, color_system=None)
-
-        def encode(job, *_args, **kwargs):
-            printed = display.getvalue()
-            for setting in ("x264", "x265", "ultrafast", "high", "main10", "4.1",
-                            "deblock", "-3,-3", "rc-lookahead"):
-                self.assertIn(setting, printed)
-            self.assertEqual(job["duration"], 3.0)
-            self.assertGreater(kwargs["timeout"], 0)
-            clock[0] += kwargs["timeout"]
-            raise crf_search.BudgetExpired("calibration exceeded remaining time")
-
-        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(120)),
-              mock.patch.object(crf_search, "run_sample", side_effect=encode) as worker,
-              mock.patch.object(crf_search.time, "monotonic", side_effect=lambda: clock[0]),
-              mock.patch.object(crf_search, "CONSOLE", console)):
-            crf_search.main([
-                str(self.source), "--config", str(config), "--output-dir", str(output),
-                "--codec", "both", "--target-seconds", "8", "--max-seconds", "10",
-            ])
-        self.assertEqual([call.args[0]["codec"] for call in worker.call_args_list], ["x264", "x265"])
-        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["state"], "time_limit")
-        for analysis in report["codecs"].values():
-            self.assertEqual(analysis["rows"], [])
-            self.assertIsNone(analysis["search"]["recommended_crf"])
-        with (output / "summary.csv").open(encoding="utf-8", newline="") as handle:
-            self.assertEqual(list(csv.DictReader(handle)), [])
-        self.assertIn("No tested CRF", display.getvalue())
+        completed = self.cli(self.source, self.directory / "too-short", "--samples", "10", "--sample-seconds", "5")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("cannot fit", completed.stderr)
 
 
 if __name__ == "__main__":

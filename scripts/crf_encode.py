@@ -2,7 +2,7 @@
 
 The encoder never creates an output movie: compressed packet sizes provide the
 video byte count. x264's closing summary and x265's frame CSV provide the
-adaptive-quantization averages used by the CRF search policy.
+quantization averages and frame counts used by the CRF sweep.
 """
 
 from __future__ import annotations

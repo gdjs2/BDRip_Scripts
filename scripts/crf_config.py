@@ -1,4 +1,4 @@
-"""Validated, reproducible settings for the PyAV CRF analyzer."""
+"""Validated sampling and encoder settings for the PyAV CRF sweep."""
 
 from __future__ import annotations
 
@@ -29,19 +29,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "crop": "auto",
         "cropdetect": {"limit": 24 / 255, "seconds": 2.0},
     },
-    "runtime": {"target_seconds": 180.0, "max_seconds": 300.0},
     "sampling": {
         "count": 10,
-        "seconds": 6.0,
+        "min_seconds": 5.0,
+        "max_seconds": 10.0,
+        "seed": 0,
         "start": 0.0,
         "end": None,
-        "stress_starts": [],
-    },
-    "search": {
-        "min_crf": 14.0,
-        "max_crf": 23.0,
-        "precision": 0.1,
-        "max_trials": 12,
     },
     "codecs": {
         "x264": {
@@ -52,11 +46,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "level": "4.1",
             "params": dict(item.split("=", 1) for item in X264_PARAMS.split(":")),
             "options": {},
-            "initial_crf": 17.5,
-            "qp_target": 19.5,
-            "qp_limit": 20.0,
-            "normal_bitrate_mbps": [8.0, 15.0],
-            "emergency_bitrate_mbps": 28.0,
         },
         "x265": {
             "preset": "slower",
@@ -66,11 +55,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "level": None,
             "params": dict(item.split("=", 1) for item in X265_PARAMS.split(":")),
             "options": {},
-            "initial_crf": 18.5,
-            "qp_target": 20.5,
-            "qp_limit": 21.0,
-            "normal_bitrate_mbps": [5.0, 10.0],
-            "emergency_bitrate_mbps": 25.0,
         },
     },
 }
@@ -225,37 +209,18 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("video.cropdetect.limit must be greater than 0 and less than 1")
     cropdetect["seconds"] = _number(cropdetect["seconds"], "video.cropdetect.seconds", positive=True)
 
-    runtime = config["runtime"]
-    for name in ("target_seconds", "max_seconds"):
-        runtime[name] = _number(runtime[name], f"runtime.{name}", positive=True)
-    if runtime["target_seconds"] > runtime["max_seconds"]:
-        raise ValueError("runtime.target_seconds must not exceed runtime.max_seconds")
-
     sampling = config["sampling"]
     sampling["count"] = _integer(sampling["count"], "sampling.count", 1)
-    sampling["seconds"] = _number(sampling["seconds"], "sampling.seconds", positive=True)
+    sampling["seed"] = _integer(sampling["seed"], "sampling.seed", 0)
+    for name in ("min_seconds", "max_seconds"):
+        sampling[name] = _number(sampling[name], f"sampling.{name}", positive=True)
+    if sampling["min_seconds"] > sampling["max_seconds"]:
+        raise ValueError("sampling.min_seconds must not exceed sampling.max_seconds")
     sampling["start"] = parse_time(sampling["start"])
     if sampling["end"] is not None:
         sampling["end"] = parse_time(sampling["end"])
         if sampling["end"] <= sampling["start"]:
             raise ValueError("sampling.end must be greater than sampling.start")
-    if not isinstance(sampling["stress_starts"], list):
-        raise ValueError("sampling.stress_starts must be an array of times")
-    sampling["stress_starts"] = [parse_time(item) for item in sampling["stress_starts"]]
-    if len(set(sampling["stress_starts"])) != len(sampling["stress_starts"]):
-        raise ValueError("sampling.stress_starts must not contain duplicate times")
-
-    search = config["search"]
-    for name in ("min_crf", "max_crf"):
-        search[name] = _number(search[name], f"search.{name}")
-        if search[name] > 51:
-            raise ValueError(f"search.{name} must be between 0 and 51")
-    if search["min_crf"] >= search["max_crf"]:
-        raise ValueError("search.min_crf must be less than search.max_crf")
-    search["precision"] = _number(search["precision"], "search.precision", minimum=0.01)
-    if search["precision"] > search["max_crf"] - search["min_crf"]:
-        raise ValueError("search.precision must not exceed the CRF search interval")
-    search["max_trials"] = _integer(search["max_trials"], "search.max_trials", 3)
 
     for name, codec in config["codecs"].items():
         prefix = f"codecs.{name}"
@@ -274,24 +239,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{prefix}.profile must be {expected_profile}")
         codec["params"] = _settings(codec["params"], f"{prefix}.params", params=True)
         codec["options"] = _settings(codec["options"], f"{prefix}.options", params=False)
-        codec["initial_crf"] = _number(codec["initial_crf"], f"{prefix}.initial_crf")
-        if not search["min_crf"] <= codec["initial_crf"] <= search["max_crf"]:
-            raise ValueError(f"{prefix}.initial_crf must be within the search CRF bounds")
-        for key in ("qp_target", "qp_limit", "emergency_bitrate_mbps"):
-            codec[key] = _number(codec[key], f"{prefix}.{key}", positive=True)
-        if codec["qp_target"] >= codec["qp_limit"]:
-            raise ValueError(f"{prefix}.qp_target must be below qp_limit")
-        normal = codec["normal_bitrate_mbps"]
-        if not isinstance(normal, list) or len(normal) != 2:
-            raise ValueError(f"{prefix}.normal_bitrate_mbps must be [minimum, maximum]")
-        codec["normal_bitrate_mbps"] = [
-            _number(item, f"{prefix}.normal_bitrate_mbps", positive=True) for item in normal
-        ]
-        low, high = codec["normal_bitrate_mbps"]
-        if low > high:
-            raise ValueError(f"{prefix}.normal_bitrate_mbps minimum must not exceed maximum")
-        if codec["emergency_bitrate_mbps"] < high:
-            raise ValueError(f"{prefix}.emergency_bitrate_mbps must be at least the normal maximum")
     return config
 
 
