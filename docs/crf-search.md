@@ -1,6 +1,6 @@
 # Two-point CRF calibration
 
-`scripts/crf_search.py` selects **one 60-second clip centered in the video**
+`bdrip crf` selects **one 60-second clip centered in the video**
 and encodes it at **CRF 13 and 20**. For each encoder it records the average
 **B-frame QP** and video bitrate, then fits two models:
 
@@ -20,13 +20,18 @@ There are only two measurements per encoder; intermediate CRFs are estimated
 without additional encoding. Runtime depends on resolution, hardware, and
 encoder settings; there is no automatic time cutoff.
 
+Implementation modules now live under `src/bdrip/crf/` and `src/bdrip/video/`.
+Use `bdrip crf` and `bdrip gui` in place of the removed script launchers.
+Existing configs and task folders keep their paths and formats. See
+[project architecture](architecture.md) and [command migration](commands.md).
+
 ## Desktop task queue
 
 ```sh
-uv run --extra gui scripts/crf_gui.py --config crf_search.example.json
+uv run --extra gui bdrip gui --config crf_search.example.json
 
 # Choose a persistent queue/results folder:
-uv run --extra gui scripts/crf_gui.py --workspace "/path/to/CRF tasks"
+uv run --extra gui bdrip gui --workspace "/path/to/CRF tasks"
 ```
 
 Choose a codec and crop, optionally edit **Encoder options…**, then click
@@ -127,10 +132,10 @@ crf-tasks/
 
 ```sh
 uv sync
-uv run scripts/crf_search.py "movie.mkv" --config crf_search.example.json
+uv run bdrip crf "movie.mkv" --config crf_search.example.json
 
 # Run one encoder and choose where to save the reports:
-uv run scripts/crf_search.py "movie.mkv" --codec x264 --output-dir "movie-calibration"
+uv run bdrip crf "movie.mkv" --codec x264 --output-dir "movie-calibration"
 ```
 
 Both codecs run by default. The default output directory beside the source is
@@ -243,8 +248,8 @@ including the odd vertical offset. Width/height must be even for these 4:2:0
 encoders; incompatible dimensions produce an error instead of rounding.
 
 ```sh
-uv run scripts/crf_search.py "movie.mkv" --config crf_search.example.json --crop 1920:804:0:137
-uv run scripts/crf_search.py "movie.mkv" --config crf_search.example.json --no-crop
+uv run bdrip crf "movie.mkv" --config crf_search.example.json --crop 1920:804:0:137
+uv run bdrip crf "movie.mkv" --config crf_search.example.json --no-crop
 ```
 
 `video.crop` accepts `"auto"` (default), `null`, or `"width:height:x:y"`.

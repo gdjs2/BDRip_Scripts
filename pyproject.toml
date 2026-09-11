@@ -1,12 +1,11 @@
 [project]
 name = "bdrip-scripts"
 version = "0.1.0"
-description = "Add your description here"
+description = "Video calibration, Blu-ray release preparation, and subtitle tools"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "av>=18.1,<19",
-    "ffmpeg-python>=0.2.0",
     "imdbinfo>=0.9.1",
     "loguru>=0.7.3",
     "matplotlib>=3.10,<4",
@@ -22,3 +21,15 @@ dependencies = [
 gui = [
     "pyside6-essentials>=6.8,<7",
 ]
+
+[project.scripts]
+bdrip = "bdrip.cli:main"
+bdrip-crf = "bdrip.crf.calibration:main"
+bdrip-gui = "bdrip.crf.gui.app:main"
+
+[build-system]
+requires = ["uv_build>=0.9.6,<0.10"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "bdrip"
