@@ -5,8 +5,8 @@ from fractions import Fraction
 import av
 
 
-def make_media(path, *, audio=True, video=True, borders=False):
-    """Write one second of moving image and optional silent audio."""
+def make_media(path, *, audio=True, video=True, borders=False, seconds=1):
+    """Write moving image and optional silent audio at 12 frames per second."""
     width, height = (128, 96) if borders else (96, 64)
     with av.open(str(path), mode="w") as output:
         video_stream = None
@@ -20,7 +20,7 @@ def make_media(path, *, audio=True, video=True, borders=False):
         if audio:
             audio_stream = output.add_stream("pcm_s16le", rate=12000)
             audio_stream.layout = "mono"
-        for index in range(12):
+        for index in range(12 * seconds):
             if video_stream is not None:
                 frame = av.VideoFrame(width, height, "yuv420p")
                 for plane_index, plane in enumerate(frame.planes):

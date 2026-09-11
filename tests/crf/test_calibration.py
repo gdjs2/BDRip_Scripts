@@ -1,7 +1,8 @@
-"""Centered sample selection, B-frame metrics and native two-point calibration."""
+"""Stratified samples, endpoint means and native two-point calibration."""
 
 import csv
 import json
+import math
 import re
 import subprocess
 import sys
@@ -13,30 +14,61 @@ from unittest import mock
 from PIL import Image
 
 from bdrip.crf import calibration as crf_search
-from bdrip.crf.model import predict, select_sample
+from bdrip.crf.model import predict, select_samples
+from bdrip.crf.plot import make_figure
 from tests.fixtures.media import make_media
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class SamplingTests(unittest.TestCase):
-    def test_minute_is_centered_in_video(self):
-        for duration in (60, 90, 600, 7200, 105.75):
-            sample = select_sample(duration)
-            self.assertEqual(sample["duration"], 60)
-            self.assertAlmostEqual(sample["start"] + 30, duration / 2)
+    def test_ten_ten_second_clips_are_spread_without_overlap(self):
+        for duration in (100, 105.75, 600, 7200):
+            samples = select_samples(duration)
+            self.assertEqual(len(samples), 10)
+            for index, sample in enumerate(samples):
+                self.assertEqual(sample["duration"], 10)
+                self.assertGreaterEqual(sample["start"], index * duration / 10)
+                self.assertLessEqual(
+                    sample["start"] + 10, (index + 1) * duration / 10 + 1e-9
+                )
+            self.assertEqual(samples, select_samples(duration))
+
+    def test_count_duration_and_random_seed_are_configurable(self):
+        samples = select_samples(300, count=3, seconds=8, seed=42)
+        self.assertEqual(len(samples), 3)
+        self.assertTrue(all(sample["duration"] == 8 for sample in samples))
+        self.assertEqual(samples, select_samples(300, count=3, seconds=8, seed=42))
+        self.assertNotEqual(samples, select_samples(300, count=3, seconds=8, seed=43))
+        self.assertTrue(all(sample["start"] % 100 > 0 for sample in samples))
 
     def test_short_video_uses_whole_duration(self):
-        for duration in (0.2, 1, 59.9):
+        for duration in (0.2, 1, 9.9):
             self.assertEqual(
-                select_sample(duration),
-                {"kind": "center", "start": 0, "duration": duration},
+                select_samples(duration),
+                [{"kind": "stratified", "start": 0, "duration": duration}],
             )
+        samples = select_samples(35)
+        self.assertEqual(len(samples), 3)
+        self.assertTrue(all(sample["duration"] == 10 for sample in samples))
 
     def test_invalid_duration_is_rejected(self):
         for duration in (0, -1, True, float("inf"), float("nan")):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
-                select_sample(duration)
+                select_samples(duration)
+
+    def test_invalid_sample_settings_are_rejected(self):
+        for field, values in (
+            ("count", (0, -1, True, 1.5)),
+            ("seconds", (0, -1, True, float("nan"))),
+            ("seed", (-1, True, 1.5)),
+        ):
+            for value in values:
+                with (
+                    self.subTest(field=field, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    select_samples(300, **{field: value})
 
 
 def metrics(duration, video_bytes, qps, counts):
@@ -50,7 +82,7 @@ def metrics(duration, video_bytes, qps, counts):
 
 
 class AverageTests(unittest.TestCase):
-    def test_qp_uses_only_b_frame_counts_and_bitrate_weights_duration(self):
+    def test_endpoint_is_equal_mean_of_clip_b_qps_and_clip_bitrates(self):
         first = metrics(
             5, 1_000_000, {"I": 10.0, "P": 20.0, "B": 30.0}, {"I": 1, "P": 3, "B": 6}
         )
@@ -61,9 +93,11 @@ class AverageTests(unittest.TestCase):
         self.assertEqual(row["samples"][0]["average_qp"], 30)
         self.assertEqual(row["samples"][0]["b_frames"], 6)
         self.assertEqual(row["samples"][1]["average_qp"], 20)
-        self.assertEqual(row["average_qp"], 27.5)
+        self.assertEqual(row["average_qp"], 25)
+        self.assertEqual(row["qp_sample_count"], 2)
+        self.assertTrue(row["complete"])
         self.assertEqual(row["b_frames"], 8)
-        self.assertAlmostEqual(row["average_bitrate_mbps"], 40 / 15)
+        self.assertAlmostEqual(row["average_bitrate_mbps"], 2.4)
         self.assertEqual(
             (row["frames"], row["duration_seconds"], row["sample_count"]), (40, 15, 2)
         )
@@ -80,21 +114,23 @@ class AverageTests(unittest.TestCase):
         self.assertEqual(row["samples"][1]["b_frames"], 0)
         self.assertEqual(row["samples"][1]["average_bitrate_mbps"], 3.2)
         self.assertEqual(row["average_qp"], 30)
+        self.assertEqual(row["qp_sample_count"], 1)
         self.assertEqual(row["b_frames"], 6)
         self.assertEqual(row["frames"], 40)
-        self.assertAlmostEqual(row["average_bitrate_mbps"], 40 / 15)
+        self.assertAlmostEqual(row["average_bitrate_mbps"], 2.4)
 
     def test_trial_without_b_frames_has_no_qp_but_still_reports_bitrate(self):
         first = metrics(5, 1_000_000, {"I": 10.0, "P": 20.0}, {"I": 1, "P": 9})
         second = metrics(10, 4_000_000, {"I": 40.0}, {"I": 30})
         row = crf_search.summarize_trial(14, [first, second])
         self.assertIsNone(row["average_qp"])
+        self.assertEqual(row["qp_sample_count"], 0)
         self.assertEqual(row["b_frames"], 0)
         self.assertTrue(all(sample["average_qp"] is None for sample in row["samples"]))
         self.assertEqual(
             (row["frames"], row["duration_seconds"], row["sample_count"]), (40, 15, 2)
         )
-        self.assertAlmostEqual(row["average_bitrate_mbps"], 40 / 15)
+        self.assertAlmostEqual(row["average_bitrate_mbps"], 2.4)
 
     def test_bad_or_incomplete_frame_metrics_are_rejected(self):
         good = metrics(5, 1000, {"I": 15.0, "P": 20.0}, {"I": 1, "P": 9})
@@ -223,12 +259,12 @@ class CalibrationIntegrationTests(unittest.TestCase):
         )
         report = json.loads((output / "results.json").read_text())
         self.assertEqual(report["state"], "complete")
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertEqual(report["qp_frame_type"], "B")
         self.assertEqual(report["crf_values"], [13, 20])
         self.assertEqual(report["method"], "two_point")
         self.assertEqual(
-            report["sample_plan"], [{"kind": "center", "start": 0, "duration": 1}]
+            report["sample_plan"], [{"kind": "stratified", "start": 0, "duration": 1}]
         )
         for codec, analysis in report["codecs"].items():
             self.assertEqual([row["crf"] for row in analysis["rows"]], [13, 20])
@@ -285,7 +321,7 @@ class CalibrationIntegrationTests(unittest.TestCase):
         svg = (output / "qp-bitrate.svg").read_text()
         self.assertIn("Average B-frame QP", svg)
         self.assertIn("Video bitrate (Mbps)", svg)
-        self.assertIn("Markers: measured CRF 13 and 20", svg)
+        self.assertIn("Markers: sample means at CRF 13 and 20", svg)
         with (
             mock.patch.object(
                 crf_search.subprocess,
@@ -341,6 +377,137 @@ class CalibrationIntegrationTests(unittest.TestCase):
                     for sample in first["samples"]
                 )
             )
+
+    def test_ten_native_samples_per_endpoint_drive_saved_means_and_curves(self):
+        source = self.directory / "long-video.mkv"
+        make_media(source, audio=False, seconds=120)
+        output = self.directory / "ten-samples"
+        completed = self.cli(
+            source,
+            output,
+            "--no-crop",
+            "--progress-file",
+            str(output / "progress.json"),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        report = json.loads((output / "results.json").read_text())
+        self.assertEqual(report["aggregation"], "sample_mean")
+        self.assertEqual(len(report["sample_plan"]), 10)
+        self.assertTrue(
+            all(sample["duration"] == 10 for sample in report["sample_plan"])
+        )
+        progress = json.loads((output / "progress.json").read_text())
+        self.assertEqual(
+            (progress["completed"], progress["total"], progress["sample_index"]),
+            (40, 40, 10),
+        )
+        self.assertEqual(len(list((output / "logs").glob("*.log"))), 40)
+        figure = make_figure(report)
+        self.addCleanup(figure.clear)
+        for codec_index, (codec, analysis) in enumerate(report["codecs"].items()):
+            for row_index, row in enumerate(analysis["rows"]):
+                self.assertTrue(row["complete"])
+                self.assertEqual(
+                    (
+                        row["sample_count"],
+                        row["expected_samples"],
+                        row["qp_sample_count"],
+                    ),
+                    (10, 10, 10),
+                )
+                self.assertEqual(
+                    [sample["sample"] for sample in row["samples"]],
+                    report["sample_plan"],
+                )
+                qp = math.fsum(sample["qp"]["B"] for sample in row["samples"]) / 10
+                rate = (
+                    math.fsum(
+                        sample["video_bytes"] * 8 / sample["duration"] / 1e6
+                        for sample in row["samples"]
+                    )
+                    / 10
+                )
+                self.assertAlmostEqual(row["average_qp"], qp)
+                self.assertAlmostEqual(row["average_bitrate_mbps"], rate)
+                fitted = predict(analysis["models"], row["crf"])
+                self.assertAlmostEqual(fitted["average_qp"], qp)
+                self.assertAlmostEqual(fitted["average_bitrate_mbps"], rate)
+                for axes, expected in zip(figure.axes, (qp, rate)):
+                    self.assertAlmostEqual(
+                        axes.collections[codec_index].get_offsets()[row_index, 1],
+                        expected,
+                    )
+                for sample in row["samples"]:
+                    self.assertEqual(sample["encoder_options"]["preset"], "ultrafast")
+                    self.assertEqual(
+                        float(sample["encoder_options"]["crf"]), row["crf"]
+                    )
+        with (output / "samples.csv").open() as handle:
+            measurements = list(csv.DictReader(handle))
+        self.assertEqual(
+            [
+                (row["codec"], int(row["crf"]), int(row["sample_index"]))
+                for row in measurements
+            ],
+            [
+                (codec, crf, sample)
+                for codec in ("x264", "x265")
+                for crf in (13, 20)
+                for sample in range(1, 11)
+            ],
+        )
+        self.assertTrue(
+            all(float(row["requested_seconds"]) == 10 for row in measurements)
+        )
+        with (output / "summary.csv").open() as handle:
+            endpoints = list(csv.DictReader(handle))
+        self.assertEqual(len(endpoints), 4)
+        self.assertTrue(
+            all(
+                row["complete"] == "True" and row["sample_count"] == "10"
+                for row in endpoints
+            )
+        )
+
+    def test_interrupt_within_endpoint_saves_clips_but_excludes_partial_mean(self):
+        output = self.directory / "partial-endpoint"
+        encoded = metrics(0.3, 1200, {"I": 18, "B": 20}, {"I": 1, "B": 3})
+        with (
+            mock.patch.object(
+                crf_search, "run_sample", side_effect=[encoded, KeyboardInterrupt]
+            ),
+            mock.patch.object(crf_search.CONSOLE, "quiet", True),
+        ):
+            code = crf_search.main(
+                [
+                    str(self.source),
+                    "--config",
+                    str(self.config),
+                    "--codec",
+                    "x264",
+                    "--no-crop",
+                    "--samples",
+                    "2",
+                    "--sample-seconds",
+                    "0.5",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+        self.assertEqual(code, 130)
+        report = json.loads((output / "results.json").read_text())
+        row = report["codecs"]["x264"]["rows"][0]
+        self.assertEqual((row["sample_count"], row["expected_samples"]), (1, 2))
+        self.assertFalse(row["complete"])
+        self.assertIsNone(report["codecs"]["x264"]["models"]["qp"])
+        self.assertIsNone(report["codecs"]["x264"]["models"]["log_bitrate"])
+        with (output / "samples.csv").open() as handle:
+            self.assertEqual(len(list(csv.DictReader(handle))), 1)
+        figure = make_figure(report)
+        self.addCleanup(figure.clear)
+        self.assertTrue(
+            all(not axes.collections and not axes.lines for axes in figure.axes)
+        )
 
     def test_calibration_without_b_frames_reports_missing_qp_and_preserves_bitrate(
         self,

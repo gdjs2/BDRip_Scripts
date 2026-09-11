@@ -1,4 +1,4 @@
-"""Validated encoder settings for calibration on one centered minute of video."""
+"""Validated sample selection, video, and encoder settings for CRF calibration."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ X265_PARAMS = (
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "sampling": {"count": 10, "seconds": 10.0, "seed": 0},
     "video": {
         "stream": 0,
         "crop": "auto",
@@ -272,8 +273,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     All other objects merge recursively; unknown schema keys are errors.
     """
     if isinstance(config, dict) and "sampling" in config:
-        # Import encoder settings from prior versions without retaining their
-        # random sampling policy. New exports use only video and codecs.
+        # Keep count/seconds/seed from older configs. Retired random-length and
+        # interval controls do not override the new fixed-duration policy.
         config = copy.deepcopy(config)
         legacy = config.pop("sampling")
         allowed = {
@@ -287,7 +288,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         }
         if not isinstance(legacy, dict) or set(legacy) - allowed:
             raise ValueError("Unknown config key or invalid legacy sampling object")
+        config["sampling"] = {
+            key: value
+            for key, value in legacy.items()
+            if key in {"count", "seconds", "seed"}
+        }
+        if config["sampling"].get("seed", 0) is None:
+            config["sampling"]["seed"] = 0
     config = _merge(DEFAULT_CONFIG, config)
+    sampling = config["sampling"]
+    sampling["count"] = _integer(sampling["count"], "sampling.count", 1)
+    sampling["seconds"] = _number(
+        sampling["seconds"], "sampling.seconds", positive=True
+    )
+    sampling["seed"] = _integer(sampling["seed"], "sampling.seed", 0)
     video = config["video"]
     video["stream"] = _integer(video["stream"], "video.stream", 0)
     crop = video["crop"]

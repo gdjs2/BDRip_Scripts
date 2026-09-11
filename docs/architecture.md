@@ -20,8 +20,8 @@ src/bdrip/
     transcode.py          Native PyAV pass worker, stats, and video-only muxing
   crf/
     config.py             Encoder defaults and config validation
-    calibration.py        Run the two CRFs, manage cache, write measurements
-    model.py              Fit and evaluate QP/bitrate equations
+    calibration.py        Encode samples at two CRFs, average measurements, cache/report
+    model.py              Select samples, fit and evaluate QP/bitrate equations
     plot.py               Shared figure construction and PNG/SVG export
     gui/
       app.py              Main window and task controls
@@ -90,8 +90,9 @@ in the existing sequence: x264 at both CRFs, followed by x265 at both CRFs.
 
 The old `scripts/` launchers and root `main.py` have been removed. Use the
 installed commands or module entry points; the [command migration table](commands.md)
-lists replacements. Example JSON paths, saved tasks, and report schemas remain
-unchanged. Native encoder code changes invalidate cached sample measurements;
+lists replacements. Example configs and saved tasks remain readable.
+Calibration schema 5 records sample means and their individual measurements.
+Native encoder code changes invalidate cached sample measurements;
 saved results and figures remain readable.
 
 Put reusable functions in the relevant package and import them by package name:

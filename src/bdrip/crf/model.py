@@ -3,23 +3,57 @@
 from __future__ import annotations
 
 import math
+import random
 
 CRF_VALUES = (13, 20)
-SAMPLE_SECONDS = 60.0
+SAMPLE_COUNT = 10
+SAMPLE_SECONDS = 10.0
 METHOD = "two_point"
 
 
-def select_sample(duration: float) -> dict:
+def select_samples(
+    duration: float,
+    count: int = SAMPLE_COUNT,
+    seconds: float = SAMPLE_SECONDS,
+    seed: int = 0,
+) -> list[dict]:
+    """Choose one reproducible random clip per equal section, without overlap.
+
+    Short videos use fewer clips of the requested length, or their whole video
+    when even one full-length clip will not fit. Never duplicate a short clip
+    just to manufacture the requested number of measurements.
+    """
     if isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
         raise ValueError("Video duration must be finite and positive")
-    length = min(SAMPLE_SECONDS, duration)
-    return {"kind": "center", "start": (duration - length) / 2, "duration": length}
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("Sample count must be a positive integer")
+    if isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Sample duration must be finite and positive")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("Sample seed must be a nonnegative integer")
+    count = min(count, max(1, int(duration // seconds)))
+    length = min(seconds, duration)
+    section = duration / count
+    rng = random.Random(seed)
+    return [
+        {
+            "kind": "stratified",
+            "start": min(
+                index * section + rng.uniform(0, max(0, section - length)),
+                duration - length,
+            ),
+            "duration": length,
+        }
+        for index in range(count)
+    ]
 
 
 def fit_models(rows: list[dict]) -> dict:
     """Fit each metric independently; missing B-frames never prevent a bitrate fit."""
     points = {}
     for row in rows:
+        if not row.get("complete", True):
+            continue
         crf = row["crf"]
         if crf not in CRF_VALUES or crf in points:
             raise ValueError(

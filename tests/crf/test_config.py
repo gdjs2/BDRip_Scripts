@@ -32,7 +32,8 @@ class ConfigTests(unittest.TestCase):
             {"sampling": {"count": 3}, "codecs": {"x264": {"preset": "fast"}}}
         )
         config["codecs"]["x264"]["params"]["bframes"] = "2"
-        self.assertNotIn("sampling", config)
+        self.assertEqual(config["sampling"], {"count": 3, "seconds": 10, "seed": 0})
+        self.assertEqual(load_config()["sampling"]["count"], 10)
         self.assertEqual(load_config()["codecs"]["x264"]["params"]["bframes"], "10")
         self.assertEqual(DEFAULT_CONFIG["codecs"]["x264"]["preset"], "placebo")
 
@@ -56,7 +57,7 @@ class ConfigTests(unittest.TestCase):
                 (preset, profile, level),
             )
 
-    def test_legacy_sampling_is_ignored_without_changing_encoder_options_or_input(self):
+    def test_legacy_sampling_preserves_count_seed_and_encoder_options(self):
         legacy = {
             "sampling": {
                 "count": 10,
@@ -70,7 +71,8 @@ class ConfigTests(unittest.TestCase):
         }
         before = json.dumps(legacy)
         config = validate_config(legacy)
-        self.assertEqual(set(config), {"video", "codecs"})
+        self.assertEqual(set(config), {"video", "codecs", "sampling"})
+        self.assertEqual(config["sampling"], {"count": 10, "seconds": 10, "seed": 123})
         self.assertEqual(config["codecs"]["x264"]["preset"], "fast")
         self.assertEqual(config["codecs"]["x264"]["params"], {"bframes": "4"})
         self.assertEqual(json.dumps(legacy), before)
@@ -86,6 +88,22 @@ class ConfigTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "Unknown config key"),
             ):
                 validate_config(old_setting)
+
+    def test_sampling_settings_are_validated(self):
+        for field, values in (
+            ("count", (0, -1, True, 1.5, "10", None)),
+            ("seconds", (0, -1, True, "10", None, float("nan"), float("inf"))),
+            ("seed", (-1, True, 1.5, "0", float("inf"))),
+        ):
+            for value in values:
+                with (
+                    self.subTest(field=field, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    validate_config({"sampling": {field: value}})
+        self.assertEqual(
+            validate_config({"sampling": {"seed": None}})["sampling"]["seed"], 0
+        )
 
     def test_auto_manual_and_disabled_crop_are_distinct(self):
         for crop in ("auto", "1920:800:0:140", "1920:804:0:137", "1280:720:1:3", None):

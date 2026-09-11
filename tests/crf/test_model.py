@@ -32,6 +32,13 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(models["log_bitrate"]["e"], 0)
         self.assertAlmostEqual(predict(models, 16)["average_bitrate_mbps"], 10)
 
+    def test_incomplete_endpoint_is_excluded_from_fitting(self):
+        rows = anchors()
+        rows[1]["complete"] = False
+        model = fit_models(rows)
+        self.assertIsNone(model["qp"])
+        self.assertIsNone(model["log_bitrate"])
+
     def test_no_model_with_one_point_and_no_qp_fit_without_b_frames(self):
         for rows in ([], anchors()[:1]):
             model = fit_models(rows)
@@ -131,6 +138,13 @@ class PlotTests(unittest.TestCase):
 
     def test_partial_report_has_measured_markers_but_no_fitted_curves(self):
         for axes in self.figure(anchors()[:1]).axes:
+            self.assertEqual(len(axes.lines), 0)
+            self.assertEqual(list(axes.collections[0].get_offsets()[:, 0]), [13])
+
+    def test_incomplete_endpoint_is_not_drawn(self):
+        rows = anchors()
+        rows[1]["complete"] = False
+        for axes in self.figure(rows).axes:
             self.assertEqual(len(axes.lines), 0)
             self.assertEqual(list(axes.collections[0].get_offsets()[:, 0]), [13])
 

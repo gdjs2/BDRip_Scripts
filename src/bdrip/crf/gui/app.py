@@ -15,6 +15,7 @@ try:
         QApplication,
         QComboBox,
         QDialog,
+        QDoubleSpinBox,
         QFileDialog,
         QGroupBox,
         QHBoxLayout,
@@ -26,6 +27,7 @@ try:
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
+        QSpinBox,
         QSplitter,
         QTabWidget,
         QTreeWidget,
@@ -97,7 +99,7 @@ class Window(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(
             QLabel(
-                "Centered 60-second sample · CRF 13 and 20 · Linear QP and exponential bitrate models"
+                "Sample means at CRF 13 and 20 · Linear QP and exponential bitrate models"
             )
         )
 
@@ -114,9 +116,18 @@ class Window(QMainWindow):
         config_row.addWidget(self.button("Save config…", self.save_settings))
         form.addLayout(config_row)
         values = QHBoxLayout()
-        values.addWidget(
-            QLabel("One clip from the middle · Whole video if shorter than 60 seconds")
+        values.addWidget(QLabel("Samples"))
+        self.sample_count = QSpinBox()
+        self.sample_count.setRange(1, 10000)
+        self.sample_count.setToolTip(
+            "Clips spread across equal sections of the video; short videos use fewer clips"
         )
+        values.addWidget(self.sample_count)
+        values.addWidget(QLabel("Seconds each"))
+        self.sample_seconds = QDoubleSpinBox()
+        self.sample_seconds.setDecimals(3)
+        self.sample_seconds.setRange(0.001, 86400)
+        values.addWidget(self.sample_seconds)
         values.addStretch()
         values.addWidget(QLabel("Codec"))
         self.codec = QComboBox()
@@ -233,6 +244,10 @@ class Window(QMainWindow):
 
     def fill_settings(self) -> None:
         self.crop.setText(self.config["video"]["crop"] or "none")
+        self.sample_count.setMaximum(max(10000, self.config["sampling"]["count"]))
+        self.sample_count.setValue(self.config["sampling"]["count"])
+        self.sample_seconds.setMaximum(max(86400, self.config["sampling"]["seconds"]))
+        self.sample_seconds.setValue(self.config["sampling"]["seconds"])
         self.update_encoder_summary()
 
     def update_encoder_summary(self) -> None:
@@ -245,6 +260,9 @@ class Window(QMainWindow):
 
     def current_config(self) -> dict:
         config = validate_config(self.config)
+        config["sampling"].update(
+            count=self.sample_count.value(), seconds=self.sample_seconds.value()
+        )
         config["video"]["crop"] = (
             None
             if self.crop.text().strip().lower() == "none"

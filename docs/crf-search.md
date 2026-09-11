@@ -1,8 +1,9 @@
 # Two-point CRF calibration
 
-`bdrip crf` selects **one 60-second clip centered in the video**
-and encodes it at **CRF 13 and 20**. For each encoder it records the average
-**B-frame QP** and video bitrate, then fits two models:
+`bdrip crf` selects **ten 10-second clips spread across the video**
+and encodes every clip at **CRF 13 and 20**. At each CRF, it takes the
+arithmetic mean of the clips' average **B-frame QPs** and video bitrates.
+These two mean endpoints define each encoder's models:
 
 ```text
 QP(c)  = a + b*c
@@ -15,14 +16,15 @@ No FFmpeg, FFprobe, HandBrake, or standalone x264/x265 executable is needed.
 Matplotlib draws the two curves. The GUI uses the optional PySide6 dependency.
 
 When both codecs are selected, the order is **x264 CRF 13 → x264 CRF 20 →
-x265 CRF 13 → x265 CRF 20**. Both encoders use the same sample and crop.
-There are only two measurements per encoder; intermediate CRFs are estimated
+x265 CRF 13 → x265 CRF 20**, completing all samples at each CRF before advancing.
+Both encoders use the same sample ranges and crop.
+There are two mean endpoints per encoder; intermediate CRFs are estimated
 without additional encoding. Runtime depends on resolution, hardware, and
 encoder settings; there is no automatic time cutoff.
 
 Implementation modules now live under `src/bdrip/crf/` and `src/bdrip/video/`.
 Use `bdrip crf` and `bdrip gui` in place of the removed script launchers.
-Existing configs and task folders keep their paths and formats. See
+Existing configs and task folders remain readable. See
 [project architecture](architecture.md) and [command migration](commands.md).
 
 ## Desktop task queue
@@ -34,15 +36,16 @@ uv run --extra gui bdrip gui --config crf_search.example.json
 uv run --extra gui bdrip gui --workspace "/path/to/CRF tasks"
 ```
 
-Choose a codec and crop, optionally edit **Encoder options…**, then click
+Choose the **Samples** count, **Seconds each**, codec, and crop, optionally edit
+**Encoder options…**, then click
 **Add videos…** and **Start queue**. Each video becomes a separate task with
 its own saved settings and output folder. Later edits affect newly added tasks.
 
 Encoding, crop detection, and PNG/SVG export run in background Python
 processes. The GUI renders the interactive plot from saved models and stays
-responsive, showing the active codec, CRF, submitted frames, elapsed time,
-and overall encoding progress. With both codecs selected,
-there are four encodes; selecting one codec runs two. Frame progress updates
+responsive, showing the active codec, CRF, sample number, submitted frames,
+elapsed time, and overall encoding progress. With ten samples and both codecs
+selected, there are **40 encodes**; selecting one codec runs 20. Frame progress updates
 during each encode, including a flushing indication while delayed frames are
 being completed. Progress reaches 100% when the task finishes successfully.
 
@@ -52,8 +55,8 @@ plot with a shared CRF x-axis**:
 - Left y-axis and solid lines: average B-frame QP.
 - Right y-axis and dashed lines: video bitrate in Mbps.
 
-Each codec has its own color. Filled markers show measured QPs and hollow
-markers show measured bitrates at CRF 13 and 20. Curves are fitted estimates.
+Each codec has its own color. Filled markers show the mean B-frame QPs and hollow
+markers show the mean bitrates at CRF 13 and 20. Curves are fitted estimates.
 Bitrate is drawn as **R(c) = exp(d + e*c)** on a linear Mbps scale, with the
 formula evaluated throughout the CRF interval. If the measured bitrates are
 close, the exponential curve can look almost straight over that interval.
@@ -78,8 +81,8 @@ is active control navigation, so turn those tools off before placing a pin.
 The toolbar supports **Pan**, rectangular **Zoom**, **Home** to restore the
 full view, and saving a figure. **Larger preview…** opens the same interactive
 plot in a resizable, non-modal window. Mouse estimates follow the correct CRF
-when zoomed or resized. The plot updates after each completed measurement and
-preserves a manually zoomed view for that task. A codec's curves become
+when zoomed or resized. An endpoint appears after all its samples finish.
+Each refresh preserves a manually zoomed view for that task. A codec's curves become
 available after both CRFs finish, so x264's model can be explored while x265
 runs. The GUI also loads existing two-point results without re-encoding them.
 
@@ -120,7 +123,8 @@ crf-tasks/
     progress.json           # Task stage, codec, CRF, overall progress
     sample-progress.json    # Current encoder's frame progress
     results.json            # Measurements and model coefficients
-    summary.csv             # Actual measurements only
+    summary.csv             # Endpoint means and sample counts
+    samples.csv             # Individual sample measurements and ranges
     estimates.csv           # Estimated values at CRFs 13 through 20
     qp-bitrate.png          # Both curves overlaid with two y-axes
     qp-bitrate.svg
@@ -136,21 +140,28 @@ uv run bdrip crf "movie.mkv" --config crf_search.example.json
 
 # Run one encoder and choose where to save the reports:
 uv run bdrip crf "movie.mkv" --codec x264 --output-dir "movie-calibration"
+
+# Override the sample plan (the defaults are 10 clips of 10 seconds):
+uv run bdrip crf "movie.mkv" --samples 10 --sample-seconds 10 --seed 0
 ```
 
 Both codecs run by default. The default output directory beside the source is
 `<movie-stem>.crf-model/`. The encoder options are printed before encoding,
-followed by the sample start/duration, measured table, and fitted equations.
+followed by all sample starts/durations, the mean endpoint table, and fitted equations.
 
 | File | Contents |
 | --- | --- |
 | `qp-bitrate.png`, `qp-bitrate.svg` | One shared-CRF plot with QP on the left y-axis and Mbps on the right, including measured points and fitted curves. |
-| `summary.csv` | Two measured rows per codec, including QP, Mbps, frame/B-frame counts, actual duration, and video bytes. |
+| `summary.csv` | Two endpoint rows per codec: mean QP/Mbps, sample counts, completion flag, and totals for frames, B-frames, duration, and video bytes. |
+| `samples.csv` | One row per completed encode: codec, CRF, sample index/range, average B-frame QP, video Mbps, counts, bytes, and cache status. |
 | `estimates.csv` | Model estimates at integer CRFs 13–20, explicitly separate from measurements. |
-| `results.json` | Source/settings/crop, exact sample range, raw I/P/B statistics, measurements, and fitted coefficients for each codec. |
+| `results.json` | Source/settings/crop, exact sample plan, raw per-sample I/P/B statistics, endpoint means, and fitted coefficients for each codec. |
 | `logs/`, `cache/` | Native logs and reusable completed measurements. |
 
-Reports and the figure update after each measurement. Their state identifies
+JSON and CSV reports update after every completed sample. Figures update after
+each completed endpoint and when a task finishes or stops. Partial endpoints
+retain their sample measurements and carry `complete: false`; they are excluded
+from fitting and plotting until all planned samples finish. Report state identifies
 running, interrupted, failed, and complete runs. Ctrl+C stops the active worker
 and retains completed results. Rerun with the same source and settings to reuse
 cached encodes; `--no-resume` forces fresh encodes. Reports in an explicitly
@@ -163,19 +174,50 @@ cancellation; remove it before a new run. The GUI manages these automatically.
 
 ## Sample and model definitions
 
-For video duration `T` in seconds:
+The default config contains:
 
-```text
-sample_duration = min(60, T)
-sample_start    = (T - sample_duration) / 2
+```json
+{"sampling": {"count": 10, "seconds": 10.0, "seed": 0}}
 ```
 
-A video shorter than 60 seconds uses its entire video stream. Times are relative
-to the selected stream's start. The report saves both the requested range and
-actual encoded timing because frame boundaries have discrete timestamps.
+Count and duration can also be changed in the GUI or with `--samples` and
+`--sample-seconds`. The seed is configurable in JSON or with `--seed`.
+For video duration `T`, requested count `N`, and clip length `L` in seconds:
 
-Let `Q13`, `Q20` be measured average B-frame QPs, and `R13`, `R20` be measured
-video bitrates in Mbps. Each encoder receives its own model:
+```text
+n = min(N, max(1, floor(T / L)))
+sample_duration = min(L, T)
+section_duration = T / n
+# For each i from 0 to n - 1, using one seeded random generator:
+sample_start[i] = i * section_duration + uniform(0, section_duration - sample_duration)
+```
+
+This places one random clip inside each equal section, without overlap. The
+same duration, configuration, and seed produce the same plan, including on retry.
+Short videos use fewer clips: a 35-second video uses three 10-second clips; a
+video shorter than 10 seconds uses its whole video stream. Times are relative
+to the selected stream's start. The report saves requested ranges and actual
+encoded timing because frame boundaries have discrete timestamps.
+
+For each clip, QP uses only B-frames, while bitrate includes **all encoded video
+frames**, including packets emitted when the encoder flushes:
+
+```text
+clip_bitrate_mbps = 8 * encoded_video_bytes / presentation_seconds / 1_000_000
+endpoint_bitrate = sum(clip_bitrate_mbps) / sample_count
+endpoint_qp      = sum(clip_average_b_frame_qp) / qp_sample_count
+```
+
+Every clip contributes equally to each mean; clips are not weighted by duration
+or B-frame count. `qp_sample_count` counts clips with a B-frame QP. A clip without
+B-frames still contributes to the bitrate mean, but is excluded from the QP mean.
+Its QP is `null` in JSON and blank in CSV. If no clip at an endpoint has B-frames,
+that endpoint has no QP; the bitrate model remains available independently.
+Raw I/P/B statistics remain saved for inspection. x264's native summary rounds
+its reported per-frame-type QPs.
+
+Let `Q13`, `Q20` be the mean B-frame QP endpoints, and `R13`, `R20` the mean
+video bitrate endpoints in Mbps. Each encoder receives its own model:
 
 ```text
 b = (Q20 - Q13) / 7
@@ -188,29 +230,17 @@ d = ln(R13) - 13*e
 The logarithm is natural. For example, if the endpoint bitrates are 16 and
 4 Mbps, the estimate at CRF 16.5 is 8 Mbps (the geometric midpoint). Both fits
 pass through their two measured endpoints. No model is produced from a single
-completed measurement.
-
-Only B-frame QP contributes to `average_qp`. Raw I/P/B statistics remain saved
-for inspection. If an encode has no B-frames, its QP is `null` in JSON, blank
-in CSV, and shown as unavailable in the GUI/console. The QP fit requires B-frame
-measurements at both CRFs; the bitrate fit remains available independently.
-x264's native summary rounds its reported per-frame-type QPs.
-
-Bitrate includes **all encoded video frames**, including packets emitted when
-the encoder flushes:
-
-```text
-average_bitrate_mbps = 8 * encoded_video_bytes / presentation_seconds / 1_000_000
-```
+completed endpoint.
 
 Audio, subtitles, and container overhead are excluded. Bitrate is measured
 output, not an enforced target rate. The saved model is under each codec's
 `models.qp` (`a`, `b`) and `models.log_bitrate` (`d`, `e`, `bitrate_unit`).
-Reports use schema version 4, `method: "two_point"`, and `qp_frame_type: "B"`.
+Reports use schema version 5, `method: "two_point"`, `aggregation: "sample_mean"`,
+`sampling_method: "stratified"`, and `qp_frame_type: "B"`.
 
-These are approximations for the selected minute and encoding settings.
+These are approximations for the selected clips and encoding settings.
 VBV limits and content changes can make actual bitrate depart from an
-exponential curve. A single minute does not measure the entire movie, and
+exponential curve. Sampling does not measure the entire movie, and
 QP values across x264 and x265 are not a shared perceptual quality scale.
 
 ## Encoder settings and exact crop
@@ -228,7 +258,7 @@ The High/8-bit and Main10/10-bit profiles are displayed for reference.
 Parameters accept colon-separated `key=value` entries or one entry per line.
 **Save** validates and applies edits to new tasks; **Cancel** discards them.
 **Restore Defaults** fills in the original settings for review before saving.
-**Load config…** and **Save config…** import/export video and encoder settings.
+**Load config…** and **Save config…** import/export sampling, video, and encoder settings.
 
 In JSON, `codecs.x264` and `codecs.x265` accept `preset`, `tune`, `profile`,
 `level`, `pixel_format`, `params`, and `options`. `params` accepts a colon-separated
@@ -239,7 +269,7 @@ Conflicting arguments and unknown config keys are rejected. Encoder availability
 pixel format, and explicit level compatibility are checked before testing.
 
 Automatic black-margin detection uses PyAV and FFmpeg's `bbox` filter to inspect
-up to two seconds at the center of the chosen minute. The detected content union
+up to two seconds at the center of each selected clip. The detected content union
 provides one crop shared by every encode. Unreliable or absent bounds retain
 the full frame. A manual crop can account for content missed by detection.
 
@@ -260,14 +290,14 @@ selects a zero-based video stream, excluding attached cover pictures.
 
 ## Existing configurations and queues
 
-The previous random sampling policy and CRF 14–18 sweep have been removed.
-Sample count, duration, seed, and sampling interval controls no longer appear
-in the GUI or CLI. Importing a previous JSON config keeps its encoder/video
-settings and ignores its recognized `sampling` block. New exports omit that
-block; the sample and measurement CRFs are fixed by this method.
+The CRF endpoints stay fixed at 13 and 20. Configs without `sampling` receive
+the new 10-by-10-second defaults. Older sampling configs retain `count` and
+`seed`; a null seed becomes 0. Retired `min_seconds`, `max_seconds`, `start`,
+and `end` fields are ignored; use `seconds` for the fixed clip duration.
+Encoder and video settings are preserved.
 
-Existing queue entries that have never run adopt the new method. Historical
-sweep tasks retain their original settings, figures, and logs. Retrying a failed
-or interrupted old sweep creates a new two-point task in a separate folder,
-so its previous measurements remain available. Completed old tasks can be
-viewed as before; add the video again to calibrate it using the new method.
+Existing queue entries that have never run adopt the new defaults. Historical
+single-clip and sweep tasks retain their settings, figures, and logs. Retrying
+a failed or interrupted historical task creates a new task in a separate folder.
+Completed old tasks can be viewed as before; add the video again to calibrate
+it using sample means. New tasks resume their own completed clips on retry.

@@ -29,7 +29,10 @@ def make_figure(report: dict, figure: Figure | None = None) -> Figure:
     ]
     has_qp = has_bitrate = missing_b_frames = False
     for codec, analysis in report["codecs"].items():
-        rows = sorted(analysis["rows"], key=lambda row: row["crf"])
+        rows = sorted(
+            (row for row in analysis["rows"] if row.get("complete", True)),
+            key=lambda row: row["crf"],
+        )
         models = analysis.get("models") or fit_models(rows)
         color, marker = PALETTE[codec]
         estimates = [predict(models, crf) for crf in grid]
@@ -106,6 +109,8 @@ def make_figure(report: dict, figure: Figure | None = None) -> Figure:
         "Markers: measured CRF 13 and 20. Curves: two-point estimates.\n"
         "Solid: QP(c) = a + bc (left axis). Dashed: R(c) = exp(d + ec) Mbps (right axis)."
     )
+    if report.get("aggregation") == "sample_mean":
+        caption = caption.replace("measured CRF", "sample means at CRF")
     if missing_b_frames:
         caption += "\nA QP curve requires B-frame measurements at both CRFs."
     figure.supxlabel(caption, fontsize=9)

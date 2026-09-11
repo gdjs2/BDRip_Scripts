@@ -21,11 +21,12 @@ uv sync
 uv run bdrip crf "movie.mkv" --config crf_search.example.json
 ```
 
-Calibration uses PyAV to encode one centered minute at CRF 13 and 20, recording
-B-frame QP and video bitrate. The GUI queues videos in background processes and
-shows the fitted QP and exponential bitrate curves with hover estimates and
-click-to-pin selection. Encoder defaults, exact cropping, report formats, and
-saved queues are unchanged by the package reorganization.
+Calibration uses PyAV to encode ten 10-second clips spread across the video at
+CRF 13 and 20, averaging each clip's B-frame QP and video bitrate into two endpoints.
+Sample count and duration are configurable. The GUI queues videos in background
+processes and shows the fitted QP and exponential bitrate curves with hover estimates and
+click-to-pin selection. Reports retain individual clip measurements, endpoint
+means, figures, and logs. Encoder settings and exact cropping are preserved.
 
 See the [calibration and GUI guide](docs/crf-search.md) for encoder options,
 progress, saved figures, logs, and result interpretation.

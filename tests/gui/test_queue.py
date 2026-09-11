@@ -120,6 +120,10 @@ class QueueTests(unittest.TestCase):
         self.window.config = validate_config(self.config)
         self.window.fill_settings()
         original = self.queue.add([str(self.source)], self.config, "both")[0]
+        self.assertEqual(self.window.sample_count.value(), 10)
+        self.assertEqual(self.window.sample_seconds.value(), 10)
+        self.window.sample_count.setValue(2)
+        self.window.sample_seconds.setValue(0.5)
         dialog = EncoderSettingsDialog(self.window.config, self.window)
         x264, x265 = dialog.editors["x264"], dialog.editors["x265"]
         x264.preset.setCurrentText("superfast")
@@ -149,6 +153,9 @@ class QueueTests(unittest.TestCase):
         task = self.queue.tasks[-1]
         self.assertEqual(original.config, self.config)
         self.assertEqual(task.config["video"]["crop"], "94:62:1:1")
+        self.assertEqual(
+            task.config["sampling"], {"count": 2, "seconds": 0.5, "seed": 0}
+        )
         saved = self.directory / "edited.json"
         with mock.patch(
             "bdrip.crf.gui.app.QFileDialog.getSaveFileName",
@@ -157,13 +164,22 @@ class QueueTests(unittest.TestCase):
             self.window.save_settings()
         self.assertEqual(load_config(saved), task.config)
         self.queue.remove(original)
+        observed_samples = set()
+        self.queue.changed.connect(
+            lambda: observed_samples.add(task.progress.get("sample_index"))
+        )
         self.queue.start()
         self.wait_until(lambda: not self.queue.enabled and self.queue.active is None)
         self.assertEqual(task.state, "completed", task.error)
         report = json.loads((self.queue.output(task) / "results.json").read_text())
         self.assertEqual(report["config"], task.config)
+        self.assertEqual((task.progress["completed"], task.progress["total"]), (8, 8))
+        self.assertTrue({1, 2} <= observed_samples)
+        self.assertEqual(len(report["sample_plan"]), 2)
         for codec, analysis in report["codecs"].items():
             for row in analysis["rows"]:
+                self.assertEqual(row["sample_count"], 2)
+                self.assertTrue(row["complete"])
                 options = row["samples"][0]["encoder_options"]
                 self.assertEqual(
                     options["preset"], "superfast" if codec == "x264" else "veryfast"
@@ -327,11 +343,13 @@ class QueueTests(unittest.TestCase):
         self.assertIn("ln R(c)", self.window.models.equations.text())
 
     def test_cancellation_reaps_encoder_preserves_results_and_retry_reuses_cache(self):
+        self.config["sampling"].update(count=2, seconds=0.5)
         task = self.queue.add([str(self.source)], self.config, "x264")[0]
         self.queue.start()
         self.wait_until(
             lambda: (
-                task.progress.get("crf") == 20
+                task.progress.get("crf") == 13
+                and task.progress.get("sample_index") == 2
                 and task.progress.get("stage") == "encoding"
                 and task.progress.get("encoder_pid")
             )
@@ -348,6 +366,12 @@ class QueueTests(unittest.TestCase):
         interrupted = json.loads((output / "results.json").read_text())
         self.assertEqual(interrupted["state"], "interrupted")
         self.assertEqual(interrupted["codecs"]["x264"]["rows"][0]["crf"], 13)
+        # The tiny second clip may finish while Qt delivers cancellation.
+        # Retain every completed clip, including one that won that race.
+        saved_row = interrupted["codecs"]["x264"]["rows"][0]
+        self.assertIn(saved_row["sample_count"], (1, 2))
+        self.assertEqual(saved_row["complete"], saved_row["sample_count"] == 2)
+        self.assertIsNone(interrupted["codecs"]["x264"]["models"]["log_bitrate"])
         self.assertTrue((output / "qp-bitrate.png").is_file())
         saved_logs = {
             path.name: path.read_bytes() for path in (output / "logs").glob("*.log")
@@ -358,7 +382,18 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(task.state, "completed", task.error)
         self.assertEqual(task.attempts, 2)
         report = json.loads((output / "results.json").read_text())
+        self.assertEqual(report["sample_plan"], interrupted["sample_plan"])
+        self.assertEqual((task.progress["completed"], task.progress["total"]), (4, 4))
+        self.assertTrue(
+            all(
+                row["complete"] and row["sample_count"] == 2
+                for row in report["codecs"]["x264"]["rows"]
+            )
+        )
         self.assertTrue(report["codecs"]["x264"]["rows"][0]["samples"][0]["cached"])
+        resumed_samples = report["codecs"]["x264"]["rows"][0]["samples"]
+        for saved_sample, resumed_sample in zip(saved_row["samples"], resumed_samples):
+            self.assertEqual(resumed_sample, {**saved_sample, "cached": True})
         for filename, contents in saved_logs.items():
             self.assertEqual((output / "logs" / filename).read_bytes(), contents)
         self.assertIn("Attempt 2", (output / "task.log").read_text())
@@ -447,17 +482,43 @@ class QueueTests(unittest.TestCase):
         try:
             waiting, history = restored.tasks
             self.assertEqual(waiting.method, "two_point")
-            self.assertNotIn("sampling", waiting.config)
+            self.assertEqual(
+                waiting.config["sampling"], {"count": 10, "seconds": 10, "seed": 42}
+            )
             self.assertEqual(history.method, "sweep")
             self.assertEqual(history.config["sampling"], {"count": 10, "seed": 42})
             retried = restored.retry(history)
             self.assertEqual(retried.method, "two_point")
             self.assertNotEqual(restored.output(retried), output)
-            self.assertEqual(retried.config, self.config)
+            self.assertEqual(retried.config, validate_config(history.config))
             self.assertEqual(history.state, "cancelled")
             for filename, contents in original.items():
                 self.assertEqual((output / filename).read_text(), contents)
             self.assertEqual(json.loads(path.read_text())["schema_version"], 2)
+        finally:
+            restored.close()
+
+    def test_retry_keeps_old_single_clip_artifacts_in_original_folder(self):
+        history = self.queue.add([str(self.source)], self.config, "x264")[0]
+        history.state, history.attempts = "cancelled", 1
+        history.config.pop("sampling")
+        original_config = json.loads(json.dumps(history.config))
+        output = self.queue.output(history)
+        artifact = output / "results.json"
+        artifact.write_text('{"schema_version":4,"sample_plan":[{"duration":60}]}')
+        original = artifact.read_bytes()
+        self.queue.save()
+        self.queue.close()
+        restored = TaskQueue(self.queue.workspace)
+        try:
+            history = restored.tasks[0]
+            self.assertEqual(history.config, original_config)
+            retried = restored.retry(history)
+            self.assertNotEqual(restored.output(retried), output)
+            self.assertEqual(
+                retried.config["sampling"], {"count": 10, "seconds": 10, "seed": 0}
+            )
+            self.assertEqual(artifact.read_bytes(), original)
         finally:
             restored.close()
 

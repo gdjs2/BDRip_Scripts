@@ -136,17 +136,18 @@ class TaskQueue(QObject):
                 ):
                     raise ValueError("Invalid saved task")
                 normalized_config = validate_config(task.config)
+                historical = task.attempts > 0 and (
+                    task.method != METHOD or "sampling" not in task.config
+                )
                 # Upgrade waiting work, while keeping historical settings and
-                # artifacts associated with measurements from the old sweep.
-                if task.method == "sweep" and task.state == "queued":
-                    if task.attempts == 0:
-                        task.method = METHOD
-                    else:
+                # artifacts from the old sweep or single centered clip.
+                if task.state == "queued":
+                    if historical:
                         task.state = "interrupted"
-                        task.error = (
-                            "Previous sweep retained; retry to create a two-point task"
-                        )
-                if task.method == METHOD:
+                        task.error = "Previous results retained; retry to create a task using sample means"
+                    elif task.method == "sweep":
+                        task.method = METHOD
+                if task.method == METHOD and not historical:
                     task.config = normalized_config
                 if task.state in {"running", "cancelling"}:
                     task.progress = read_json(self.output(task) / "progress.json")
@@ -230,7 +231,7 @@ class TaskQueue(QObject):
     def retry(self, task: Task) -> Task | None:
         if task.state not in {"failed", "cancelled", "interrupted"}:
             return
-        if task.method != METHOD:
+        if task.method != METHOD or "sampling" not in task.config:
             return self.add([task.video], task.config, task.codec)[0]
         task.state, task.error, task.progress = "queued", "", {}
         task.started = task.finished = None
