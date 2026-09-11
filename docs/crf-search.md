@@ -184,6 +184,13 @@ Task runners can use `--progress-file PATH` for atomic JSON progress and
 `--cancel-file PATH` for a cancellation marker. Creating the marker requests
 cancellation; remove it before a new run. The GUI manages these automatically.
 
+On Windows, progress readers or antivirus scanners can briefly block replacement
+of a JSON snapshot. The writer retries access/sharing errors with short delays
+(up to 0.71 seconds total), keeping the previous complete snapshot available.
+Persistent access errors are still reported; use a writable output directory
+if the destination does not permit replacement. After updating the program,
+restart the GUI and retry an interrupted task to reuse its completed encodes.
+
 ## Sample and model definitions
 
 The default config contains:
