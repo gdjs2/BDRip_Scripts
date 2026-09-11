@@ -28,7 +28,7 @@ class ConfigTests(unittest.TestCase):
         config = validate_config({"sampling": {"count": 3}, "codecs": {"x264": {"preset": "fast"}}})
         config["codecs"]["x264"]["params"]["bframes"] = "2"
         self.assertEqual(config["sampling"]["count"], 3)
-        self.assertEqual(config["sampling"]["seconds"], 45.0)
+        self.assertEqual(config["sampling"]["seconds"], 6.0)
         self.assertEqual(load_config()["codecs"]["x264"]["params"]["bframes"], "10")
         self.assertEqual(DEFAULT_CONFIG["codecs"]["x264"]["preset"], "placebo")
 
@@ -43,8 +43,32 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((codec["preset"], codec["profile"], codec["level"]),
                              (preset, profile, level))
 
+    def test_runtime_defaults_and_partial_overrides(self):
+        config = load_config()
+        self.assertEqual(config["runtime"], {"target_seconds": 180.0, "max_seconds": 300.0})
+        self.assertEqual(config["sampling"]["count"], 10)
+        self.assertEqual(config["sampling"]["seconds"], 6.0)
+        self.assertEqual(config["search"]["max_trials"], 6)
+        config = validate_config({"runtime": {"target_seconds": 120}})
+        self.assertEqual(config["runtime"], {"target_seconds": 120.0, "max_seconds": 300.0})
+        self.assertIsInstance(config["runtime"]["target_seconds"], float)
+        config["runtime"]["max_seconds"] = 200
+        self.assertEqual(load_config()["runtime"]["max_seconds"], 300.0)
+        self.assertEqual(validate_config({"runtime": {"target_seconds": 300}})["runtime"],
+                         {"target_seconds": 300.0, "max_seconds": 300.0})
+
+    def test_runtime_requires_positive_finite_consistent_budgets(self):
+        for field in ("target_seconds", "max_seconds"):
+            for value in (0, -1, True, None, "180", float("nan"), float("inf")):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    validate_config({"runtime": {field: value}})
+        for runtime in (None, [], {"target_seconds": 301}, {"max_seconds": 179},
+                        {"target_seconds": 60, "max_seconds": 30}, {"timeout": 300}):
+            with self.subTest(runtime=runtime), self.assertRaises(ValueError):
+                validate_config({"runtime": runtime})
+
     def test_auto_manual_and_disabled_crop_are_distinct(self):
-        for crop in ("auto", "1920:800:0:140", None):
+        for crop in ("auto", "1920:800:0:140", "1920:804:0:137", "1280:720:1:3", None):
             with self.subTest(crop=crop):
                 config = validate_config({"video": {"crop": crop}})
                 self.assertEqual(config["video"]["crop"], crop)
@@ -53,6 +77,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["video"]["cropdetect"], {"limit": 24 / 255, "seconds": 4.0})
         config["video"]["cropdetect"]["limit"] = 0.2
         self.assertEqual(load_config()["video"]["cropdetect"]["limit"], 24 / 255)
+
+    def test_manual_crop_keeps_exact_dimensions_and_odd_offsets(self):
+        config = validate_config({"video": {"crop": "1920:804:0:137"}})
+        self.assertEqual(config["video"]["crop"], "1920:804:0:137")
+        for crop in ("1919:804:0:137", "1920:803:0:137", "1919:803:1:137"):
+            with self.subTest(crop=crop), self.assertRaises(ValueError):
+                validate_config({"video": {"crop": crop}})
 
     def test_crop_detection_settings_are_validated(self):
         for field, values in (("limit", (0, -0.1, 1, 24, True, "0.1", float("nan"), float("inf"))),
@@ -126,7 +157,7 @@ class ConfigTests(unittest.TestCase):
             {"codecs": {"x264": {"pixel_format": "yuv420p10le"}}},
             {"codecs": {"x265": {"profile": "main"}}},
             {"video": {"stream": -1}},
-            {"video": {"crop": "1920:800:0:1"}},
+            {"video": {"crop": "1920:801:0:1"}},
             {"video": {"crop": "iw:ih:0:0"}},
         ]
         for config in configs:

@@ -179,8 +179,10 @@ uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json
 
 The example includes the supplied x264/x265 argument strings. Defaults are
 x264 High@4.1 with `placebo`, and x265 Main10 with automatic level and `slower`.
+The selected preset, profile, level, pixel format, tune, encoder parameters,
+and additional codec options are printed before encoding starts.
 Every CRF trial uses the same configured preset, tune, crop, and encoder
-arguments. To obtain a measured table at specific CRFs instead of
+arguments. To request a measured table at specific CRFs instead of
 automatically searching for the highest tested passing CRF:
 
 ```powershell
@@ -188,8 +190,24 @@ uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec
 uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec x264 --crf-range 16:22:0.5
 ```
 
-Default sampling uses ten evenly distributed 45-second windows, reducing their
-count or duration for short clips. Set `--start` and `--end` to exclude credits
+The default runtime target is three minutes, with a five-minute maximum for
+the whole analysis, including source inspection, cropping, and calibration.
+When needed, calibration measures encoding speed and chooses a common sample duration of
+up to six seconds for ten evenly distributed windows. That duration stays
+fixed across both codecs and all CRFs. Automatic search tests at most six CRFs
+per codec, subject to the shared runtime budget. Complete trials alternate
+between codecs; each gets a reserved share to attempt its first trial even
+after the soft target, which gates additional trials. Unused time from a
+finished codec is shared with the others. Short samples provide
+preliminary estimates; slow encoders may reach the limit before completing a
+table row. Completed rows are retained with a `time_limit` outcome, and the
+maximum deadline stops any active worker. Use `--target-seconds` and
+`--max-seconds` to override the budget; `--max-seconds` alone also lowers the
+existing target if necessary. `--sample-seconds` sets the sample duration upper
+limit. Calibration is skipped for clips already at the minimum sample length,
+and matching resumed runs reuse their fixed sample plan.
+
+Short clips reduce the sample count or duration. Set `--start` and `--end` to exclude credits
 or other unwanted sections. Add a known difficult scene with repeatable
 `--stress-start HH:MM:SS` arguments. Stress scenes must meet the QP target, but
 are excluded from the estimated movie-average bitrate.
@@ -198,17 +216,21 @@ Black-margin detection runs once before encoding, examining up to two seconds
 at the center of each representative and stress sample. It combines the
 detected content bounds into one conservative crop, shared by both codecs and
 every CRF, and displays the crop and resulting dimensions before trials begin.
-The detector uses PyAV decoding and FFmpeg's `bbox` filter through PyAV. Configure its
-luminance threshold and scan duration under `video.cropdetect`. Use
-`--crop 1920:800:0:140` for a manual crop, or `--no-crop` / `--crop none` to retain
+The crop retains its exact width, height, and offsets; for example, a detected
+`1920:804:0:137` remains 1920×804. Offsets may be odd, but width and height must
+be even for the configured 4:2:0 encoders. An odd detected dimension stops the
+run before encoding; supply an explicit crop with even dimensions to proceed.
+The detector uses PyAV decoding and FFmpeg's `bbox` filter through PyAV.
+Configure its luminance threshold and scan duration under `video.cropdetect`.
+Use `--crop 1920:804:0:137` for a manual crop, or `--no-crop` / `--crop none` to retain
 the full frame. If detection finds no usable content bounds, it retains the
 full frame automatically.
 
 The console table and `<movie-stem>.crf-search/summary.csv` show CRF, measured
 sample video Mbps, QP95, worst representative QP, stress QP, and status.
 `results.json` records settings, resolved crop detection, sample measurements,
-the recommendation, and
-a descriptive bitrate fit when at least three CRFs were measured. Video Mbps
+the recommendation, and a descriptive bitrate fit when at least three CRFs
+were measured. Video Mbps
 excludes audio and container overhead; it estimates full-movie video bitrate
 from the chosen samples. Completed samples and encoder logs are saved alongside
 the reports, and rerunning the same command reuses matching completed samples.

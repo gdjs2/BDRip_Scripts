@@ -41,11 +41,11 @@ def frame_with_bounds(
 def make_video(
     path: Path, bounds: list[tuple[int, int, int, int] | None],
     *, depth: int = 8, start_ms: int = 0, duration_ms: int = 100,
-    black: int = 16, content: int = 128,
+    black: int = 16, content: int = 128, width: int = 128, height: int = 96,
 ) -> None:
     with av.open(str(path), "w") as output:
         stream = output.add_stream("ffv1", rate=10)
-        stream.width, stream.height = 128, 96
+        stream.width, stream.height = width, height
         stream.pix_fmt = "yuv420p" if depth == 8 else "yuv420p10le"
         stream.time_base = Fraction(1, 1000)
         stream.codec_context.time_base = Fraction(1, 1000)
@@ -56,7 +56,8 @@ def make_video(
                 output.mux(packet)
 
         for index, rectangle in enumerate(bounds):
-            frame = frame_with_bounds(rectangle, depth=depth, black=black, content=content)
+            frame = frame_with_bounds(rectangle, depth=depth, black=black, content=content,
+                                      width=width, height=height)
             frame.pts = start_ms + index * duration_ms
             frame.time_base = Fraction(1, 1000)
             frame.duration = duration_ms
@@ -106,11 +107,34 @@ class CropDetectionTests(unittest.TestCase):
                 self.assertEqual(result["windows"][0]["bit_depth"], depth)
                 self.assertEqual(result["windows"][0]["threshold"], threshold)
 
-    def test_rounding_keeps_every_detected_pixel(self):
+    def test_detected_bounds_remain_exact_with_odd_origin(self):
         make_video(self.path, [(9, 7, 118, 86)] * 3)
         result = self.detect()
-        self.assertEqual(result["crop"], "112:82:8:6")
+        self.assertEqual(result["crop"], "110:80:9:7")
+        self.assertEqual((result["width"], result["height"]), (110, 80))
         self.assertEqual(result["bounds"], {"x1": 9, "y1": 7, "x2": 118, "y2": 86})
+
+    def test_1920_by_804_content_keeps_exact_height_at_even_and_odd_origins(self):
+        for y in (137, 138, 139):
+            with self.subTest(y=y):
+                make_video(self.path, [(0, y, 1919, y + 803)] * 2,
+                           width=1920, height=1080)
+                result = self.detect()
+                self.assertEqual(result["crop"], f"1920:804:0:{y}")
+                self.assertEqual((result["width"], result["height"]), (1920, 804))
+                self.assertEqual(result["bounds"], {"x1": 0, "y1": y,
+                                                    "x2": 1919, "y2": y + 803})
+
+    def test_odd_detected_dimensions_are_returned_without_padding_or_trimming(self):
+        for rectangle, expected, dimensions in (
+            ((9, 7, 117, 86), "109:80:9:7", (109, 80)),
+            ((9, 7, 118, 85), "110:79:9:7", (110, 79)),
+        ):
+            with self.subTest(rectangle=rectangle):
+                make_video(self.path, [rectangle] * 3)
+                result = self.detect()
+                self.assertEqual(result["crop"], expected)
+                self.assertEqual((result["width"], result["height"]), dimensions)
 
     def test_variable_aspect_ratios_use_union_of_representative_and_stress_windows(self):
         make_video(self.path, [(0, 16, 127, 79)] * 10 + [(0, 8, 127, 87)] * 10)

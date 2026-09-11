@@ -575,6 +575,9 @@ uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json
 Both codecs run by default. Use `--codec x264` or `--codec x265` to select one.
 Omitting `--config` uses the same defaults as the example. This is a standalone
 analyzer; it does not change the existing HandBrake release pipeline.
+The default runtime target is 180 seconds, with a maximum of 300 seconds for
+the combined analysis. Short, calibrated samples provide preliminary estimates
+within this budget; a complete table is not guaranteed for slow encoders.
 
 ### Encoder configuration
 
@@ -602,6 +605,10 @@ x265: deblock=-3,-3:ctu=32:rskip=2:early-skip=1:tu-inter-depth=3:tu-intra-depth=
 | `qp_limit` | Threshold for labelling a failed trial as over the limit; defaults 20 / 21. |
 | `normal_bitrate_mbps` | Preferred video bitrate interval; defaults `[8,15]` / `[5,10]`. |
 | `emergency_bitrate_mbps` | Warning threshold; defaults 28 / 25. |
+
+Before any encoding, the analyzer prints each selected codec's preset,
+profile, level, pixel format, tune, encoder parameters, and additional codec
+AVOptions. These remain fixed during calibration and all CRF trials.
 
 Partial JSON configurations merge with defaults. **Providing `params` or
 `options` replaces that entire dictionary**, allowing defaults to be removed:
@@ -633,16 +640,18 @@ to the capabilities of the installed libraries.
 | Config field | Default and behavior |
 | --- | --- |
 | `video.stream` | `0`: zero-based index among video streams. Other stream types are ignored. |
-| `video.crop` | `"auto"` detects black margins before encoding; `null` disables cropping. A fixed `width:height:x:y` overrides detection; dimensions and offsets must be even integers, with positive dimensions. |
+| `video.crop` | `"auto"` detects black margins before encoding; `null` disables cropping. A fixed `width:height:x:y` overrides detection. Width and height must be positive even integers; x/y offsets are nonnegative integers and may be odd. |
 | `video.cropdetect.limit` | `0.09411764705882353` (`24/255`): normalized raw luminance threshold, scaled to the video's bit depth; must be greater than 0 and less than 1. |
 | `video.cropdetect.seconds` | `2.0`: maximum scan duration centered within each representative and stress sample; must be positive. |
 | `sampling.count` | `10` representative windows centered in equally sized time intervals. |
-| `sampling.seconds` | `45.0` seconds per window. Short inputs reduce count and then duration as needed. |
+| `sampling.seconds` | `6.0`: maximum seconds per window; calibrated encoding speed can shorten it. Short inputs reduce count and then duration as needed. |
 | `sampling.start` / `sampling.end` | `0` / `null` (video end); both are relative to the video's start. |
 | `sampling.stress_starts` | `[]`; extra known difficult scenes, each using the configured sample duration or remaining video duration. |
 | `search.min_crf` / `search.max_crf` | `14.0` / `23.0`; automatic search bounds within 0–51. |
 | `search.precision` | `0.1`; refinement step, at least 0.01 and no larger than the search interval. |
-| `search.max_trials` | `12` per codec; integer of at least 3. |
+| `search.max_trials` | `6` per codec; integer of at least 3, subject to the shared runtime budget. |
+| `runtime.target_seconds` | `180.0`: soft runtime target, checked before additional CRF trials after each codec's first attempt. |
+| `runtime.max_seconds` | `300.0`: maximum runtime; stops an active worker at the deadline. Must be at least `target_seconds`. |
 
 Times accept seconds, `MM:SS`, or `HH:MM:SS`, including fractional seconds.
 Representative sampling spans the full video by default; it does not detect
@@ -662,6 +671,43 @@ the video. All CRFs reuse the same representative and stress sample ranges.
 The analyzer preserves presentation timing and measures only the chosen video
 stream. Resolution remains at the source size apart from the resolved crop.
 
+### Runtime budget and calibration
+
+The runtime budget is shared by all selected codecs and includes source
+inspection, crop detection, calibration, and CRF trials. Complete CRF trials
+alternate between codecs, with reserved shares of the remaining maximum
+budget so each can attempt its first trial even after the soft target. The
+target gates additional trials; a finished codec's unused share is distributed
+to the others. The maximum stops active work at the deadline.
+Both values must be positive finite seconds, with the target no greater than
+the maximum. Override them for one run with:
+
+```sh
+uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --target-seconds 120 --max-seconds 180
+```
+
+Supplying `--max-seconds` alone also lowers the existing target when necessary.
+
+Calibration encodes a short sample using the selected settings to measure
+speed. Its duration accounts for encoder lookahead and B-frame buffering:
+at least `max(3, (rc-lookahead + bframes + 1) / fps)` seconds, capped by the
+configured sample duration and available source interval. The measured speed
+determines a common sample length no greater than `sampling.seconds`. This
+final length and the sample ranges stay fixed across all CRFs and codecs.
+The analyzer does not change presets or custom parameters to fit the budget.
+Calibration is skipped when the requested or available clip length is already
+at or below this minimum. A resumed run with the same source and config reuses
+its previously fixed calibrated sample plan.
+
+Short samples are preliminary estimates: they contain proportionally more GOP
+startup and less scene coverage than longer encodes. The runtime limit may
+arrive before any complete CRF row is available, especially with expensive
+presets or large frames. Only completed trials contribute table rows and
+recommendations. The report records `time_limit` when the budget stops work
+and preserves completed results; an unfinished trial is not extrapolated into
+a measured row. Increase the runtime budget and sample-duration limit when
+longer measurements are needed.
+
 ### Automatic black-margin crop
 
 With the default `video.crop: "auto"`, crop detection runs once before the CRF
@@ -675,14 +721,21 @@ grayscale inputs retain their native bit depth. Unsupported formats or formats
 without a luminance plane retain the full frame. This requires no external
 executable or FFmpeg `cropdetect` filter.
 
-The detector takes the union of all usable content rectangles, then rounds
-outward to even dimensions and offsets. The resulting crop retains content
+The detector takes the exact union of all usable content rectangles and keeps
+its width, height, and x/y offsets unchanged. The resulting crop retains content
 seen across the inspected scenes, including changes of aspect ratio. If no
 usable bounds are found, the combined bounds cover the full frame, or the
 detected rectangle is suspiciously small, it retains the full frame. The
 automatic crop must retain at least half the original area and at least half
 of each original dimension. This is a conservative sample-based decision: a
 scene outside the inspected windows can still contain content nearer an edge.
+
+Crop coordinates are exact: detected `1920:804:0:137` produces 1920×804 video
+at offset x=0, y=137. Odd offsets are allowed. Width and height must be even for
+the configured 4:2:0 encoders; an odd detected width or height causes a clear
+error before encoding. The analyzer does not round dimensions, add padding,
+or discard pixels to meet that requirement. Supply an explicit manual crop
+with even dimensions when a different rectangle is intended.
 
 The resolved crop and dimensions are displayed before encoding. Both codecs
 and every CRF use that same crop. `results.json` retains the requested crop
@@ -693,17 +746,17 @@ Automatic detection is identified as `detector: "pyav-bbox-luma"`.
 To supply known bounds or retain the whole frame:
 
 ```sh
-uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --crop 1920:800:0:140
+uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --crop 1920:804:0:137
 uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --no-crop
 ```
 
-The equivalent config values are `"crop": "1920:800:0:140"` and `"crop": null`.
+The equivalent config values are `"crop": "1920:804:0:137"` and `"crop": null`.
 `--crop none` is equivalent to `--no-crop`; `--crop auto` re-enables detection
 for a config that otherwise disables it.
 
 ### Explicit CRF sweeps
 
-For a complete measured relationship table at chosen CRFs, use one of:
+To request a measured relationship table at chosen CRFs, use one of:
 
 ```sh
 uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec x265 --crf-values 16,17,18,19,20,21,22
@@ -713,6 +766,8 @@ uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec
 The range includes its maximum if the step reaches it exactly. Sweep values
 must be within 0–51; they are independent of the automatic search's configured
 bounds and trial limit. `--crf-values` and `--crf-range` are mutually exclusive.
+The global runtime budget also applies to sweeps, so a sweep can finish with
+only the rows completed before the deadline.
 
 ### Selection policy and outputs
 
@@ -727,10 +782,10 @@ do not guarantee visual transparency.
 
 Automatic search tests the initial CRF and nearby values, expands toward a
 pass/fail bracket, and uses local QP interpolation to choose further real
-encodes. It stops at the requested precision, a bound, the trial limit, or
-observed nonmonotonic QP behavior. The recommendation is always the **highest
+encodes. It stops at the requested precision, a bound, the trial limit, the
+runtime budget, or observed nonmonotonic QP behavior. The recommendation is always the **highest
 tested passing CRF**, and may be absent if no tested value passed. Reaching a
-bound or trial limit does not establish a global optimum. The same encoder
+bound, trial limit, or runtime limit does not establish a global optimum. The same encoder
 settings and preset apply to every trial; only CRF changes.
 
 Normal and emergency bitrate values are preferences and warnings, not hard
@@ -758,8 +813,10 @@ The default output directory is `<movie-stem>.crf-search` beside the movie:
   encoder settings, sample ranges, and library/backend versions.
 
 Use `--output-dir` to choose another directory. Completed samples are cached
-through interruption; rerun the command to resume. `--no-resume` forces fresh
-sample encodes. Existing reports in the chosen directory are updated for the
+through interruption; rerun the command to resume. Matching resumed runs reuse
+the fixed sample plan without recalibration. `--no-resume` forces fresh sample
+encodes. Changing the budget can change the calibrated sample ranges; only
+samples matching those ranges can be reused. Existing reports in the chosen directory are updated for the
 current run, so use separate output directories to retain multiple reports.
 The relationship fit is labelled as a prediction model and never replaces a
 measured table row or verification encode.

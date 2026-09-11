@@ -2,7 +2,7 @@
 
 The bundled PyAV wheel includes bbox but not cropdetect. bbox detects every
 pixel above a raw-luminance threshold and exposes exact bounds as frame
-metadata. Their union, rounded outward, avoids trimming observed content.
+metadata. Their exact union is used without rounding dimensions or offsets.
 """
 
 from __future__ import annotations
@@ -257,14 +257,10 @@ def detect_crop(
     if (active_width * 2 < width or active_height * 2 < height
             or active_width * active_height * 2 < width * height):
         return finish("small_content", "Detected content is too small to distinguish margins from a dark scene; kept the full frame")
-    # Round both outside edges outward, instead of rounding the crop width
-    # down as cropdetect normally does. Preserve every observed active pixel.
-    left, top = x1 // 2 * 2, y1 // 2 * 2
-    right, bottom = (x2 + 2) // 2 * 2, (y2 + 2) // 2 * 2
-    if right > width or bottom > height:
-        return finish("alignment_uncertain", "Even crop alignment would discard detected content; kept the full frame")
-    out_width, out_height = right - left, bottom - top
-    if (left, top, out_width, out_height) == (0, 0, width, height):
-        return finish("full_frame_after_alignment", "Detected margins are too narrow for an even crop; kept the full frame")
-    result.update(crop=f"{out_width}:{out_height}:{left}:{top}", width=out_width, height=out_height)
-    return finish("detected_margins", "One outward-aligned crop preserves the union of content in all detection windows")
+    # Offsets may be odd even when the picture dimensions are even. Expanding
+    # both edges to even coordinates would turn an 804-line picture at y=137
+    # into 806 lines. Preserve the measured rectangle; encoder preflight checks
+    # dimension compatibility separately without changing these pixel bounds.
+    result.update(crop=f"{active_width}:{active_height}:{x1}:{y1}",
+                  width=active_width, height=active_height)
+    return finish("detected_margins", "Exact crop preserves the union of content in all detection windows")

@@ -29,9 +29,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "crop": "auto",
         "cropdetect": {"limit": 24 / 255, "seconds": 2.0},
     },
+    "runtime": {"target_seconds": 180.0, "max_seconds": 300.0},
     "sampling": {
         "count": 10,
-        "seconds": 45.0,
+        "seconds": 6.0,
         "start": 0.0,
         "end": None,
         "stress_starts": [],
@@ -40,7 +41,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_crf": 14.0,
         "max_crf": 23.0,
         "precision": 0.1,
-        "max_trials": 12,
+        "max_trials": 6,
     },
     "codecs": {
         "x264": {
@@ -216,13 +217,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(crop, str) or not re.fullmatch(r"\d+:\d+:\d+:\d+", crop):
             raise ValueError("video.crop must be 'auto', null, or integer 'width:height:x:y'")
         width, height, x, y = map(int, crop.split(":"))
-        if width <= 0 or height <= 0 or any(value % 2 for value in (width, height, x, y)):
-            raise ValueError("video.crop dimensions must be positive and all values even for 4:2:0")
+        if width <= 0 or height <= 0 or width % 2 or height % 2:
+            raise ValueError("video.crop width and height must be positive and even for 4:2:0; offsets may be odd")
     cropdetect = video["cropdetect"]
     cropdetect["limit"] = _number(cropdetect["limit"], "video.cropdetect.limit", positive=True)
     if cropdetect["limit"] >= 1:
         raise ValueError("video.cropdetect.limit must be greater than 0 and less than 1")
     cropdetect["seconds"] = _number(cropdetect["seconds"], "video.cropdetect.seconds", positive=True)
+
+    runtime = config["runtime"]
+    for name in ("target_seconds", "max_seconds"):
+        runtime[name] = _number(runtime[name], f"runtime.{name}", positive=True)
+    if runtime["target_seconds"] > runtime["max_seconds"]:
+        raise ValueError("runtime.target_seconds must not exceed runtime.max_seconds")
 
     sampling = config["sampling"]
     sampling["count"] = _integer(sampling["count"], "sampling.count", 1)

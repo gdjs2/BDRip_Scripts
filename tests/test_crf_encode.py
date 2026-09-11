@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import av
 
@@ -155,6 +157,136 @@ class NativeSamplingTests(unittest.TestCase):
         source.update(width=3840, height=2160)
         with self.assertRaisesRegex(backend.EncodingError, "level 4.1"):
             backend.validate_source_settings(source, "x264", settings)
+
+
+class ExactCropEncodingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="test-crf-exact-crop-")
+        cls.sources = {}
+        for top in (137, 139):
+            path = Path(cls.temporary.name) / f"letterbox-{top}.mkv"
+            frame = av.VideoFrame(1920, 1080, "yuv420p")
+            for index, plane in enumerate(frame.planes):
+                plane.update(bytes([16 if index == 0 else 128]) * plane.buffer_size)
+            plane = frame.planes[0]
+            pixels = bytearray(bytes(plane))
+            for relative_y in range(804):
+                # Distinct neighboring rows expose an incorrectly rounded
+                # vertical origin; marked columns also test an odd x origin.
+                row = bytearray([32 + relative_y % 192]) * 1920
+                row[0], row[1], row[-2], row[-1] = 40, 80, 100, 160
+                offset = (top + relative_y) * plane.line_size
+                pixels[offset:offset + 1920] = row
+            plane.update(pixels)
+            frame.pts, frame.time_base, frame.duration = 0, Fraction(1, 25), 1
+            with av.open(str(path), "w") as output:
+                stream = output.add_stream("ffv1", rate=25)
+                stream.width, stream.height, stream.pix_fmt = 1920, 1080, "yuv420p"
+                for packet in stream.encode(frame):
+                    output.mux(packet)
+                for packet in stream.encode(None):
+                    output.mux(packet)
+            cls.sources[top] = path
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def assert_exact_crop(self, codec, *, top, left=0, width=1920):
+        library = "libx264" if codec == "x264" else "libx265"
+        try:
+            av.Codec(library, "w")
+        except (av.FFmpegError, ValueError) as exc:
+            raise unittest.SkipTest(f"PyAV wheel has no {library} encoder") from exc
+        observed = []
+        compressed = []
+
+        class RecordingEncoder:
+            """Observe the real pipeline input while still using the native codec."""
+
+            def __init__(self, wrapped):
+                object.__setattr__(self, "wrapped", wrapped)
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def __setattr__(self, name, value):
+                setattr(self.wrapped, name, value)
+
+            def encode(self, frame=None):
+                if frame is not None:
+                    plane = frame.planes[0]
+                    sample_bytes = 1 if frame.format.components[0].bits == 8 else 2
+                    data = memoryview(plane)
+
+                    def pixel(x, y):
+                        offset = y * plane.line_size + x * sample_bytes
+                        return int.from_bytes(data[offset:offset + sample_bytes], "little")
+
+                    observed.append({
+                        "size": (frame.width, frame.height),
+                        "top": pixel(frame.width // 2, 0),
+                        "bottom": pixel(frame.width // 2, frame.height - 1),
+                        "left": pixel(0, 0), "right": pixel(frame.width - 1, 0),
+                    })
+                packets = self.wrapped.encode(frame)
+                compressed.extend(bytes(packet) for packet in packets)
+                return packets
+
+        class RecordingAv:
+            CodecContext = SimpleNamespace(
+                create=lambda name, mode: RecordingEncoder(av.CodecContext.create(name, mode))
+            )
+
+            def __getattr__(self, name):
+                return getattr(av, name)
+
+        params = {"bframes": "0", "rc-lookahead": "0"}
+        if codec == "x265":
+            params.update(pools="none", **{"frame-threads": "1"})
+        settings = {
+            "preset": "ultrafast", "pixel_format": "yuv420p" if codec == "x264" else "yuv420p10le",
+            "profile": "high" if codec == "x264" else "main10",
+            "params": params, "options": {"threads": "1"},
+        }
+        job = {
+            "input": str(self.sources[top]), "start": 0.0, "duration": 0.04,
+            "codec": codec, "crf": 18, "crop": f"{width}:804:{left}:{top}",
+            "settings": settings,
+        }
+        with patch.object(backend, "av", RecordingAv()), contextlib.redirect_stderr(io.StringIO()):
+            result = backend.encode_sample(job)
+        scale = 1 if codec == "x264" else 4
+        self.assertEqual(result["frames"], 1)
+        self.assertEqual((result["width"], result["height"]), (width, 804))
+        self.assertEqual(observed, [{
+            "size": (width, 804), "top": 32 * scale, "bottom": 67 * scale,
+            "left": (80 if left else 40) * scale,
+            "right": (100 if left else 160) * scale,
+        }])
+        self.assertEqual(result["frame_counts"], {"I": 1})
+        # Decode the actual compressed packets too: a correct reported size
+        # alone would not catch padding or changed conformance dimensions.
+        decoder = av.CodecContext.create("h264" if codec == "x264" else "hevc", "r")
+        decoded = []
+        for payload in compressed:
+            decoded.extend(decoder.decode(av.Packet(payload)))
+        decoded.extend(decoder.decode(None))
+        self.assertEqual([(frame.width, frame.height) for frame in decoded], [(width, 804)])
+
+    def test_x264_preserves_804_rows_at_odd_vertical_offsets(self):
+        for top in (137, 139):
+            with self.subTest(top=top):
+                self.assert_exact_crop("x264", top=top)
+
+    def test_x265_preserves_804_rows_at_odd_vertical_offsets(self):
+        for top in (137, 139):
+            with self.subTest(top=top):
+                self.assert_exact_crop("x265", top=top)
+
+    def test_odd_horizontal_offset_preserves_the_requested_source_column(self):
+        self.assert_exact_crop("x264", top=137, left=1, width=1918)
 
 
 if __name__ == "__main__":

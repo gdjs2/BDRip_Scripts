@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 from fractions import Fraction
+import io
 import json
 import math
 from pathlib import Path
@@ -273,6 +274,70 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(summary["reason"], "precision_reached")
         self.assertTrue(all(low <= row["crf"] <= high for row in rows))
 
+    def test_incremental_trials_finish_with_a_measured_passing_crf(self):
+        rows = []
+        search = {"min_crf": 14.0, "max_crf": 23.0,
+                  "precision": 0.1, "max_trials": 12}
+        for _ in range(search["max_trials"] + 1):
+            crf, summary = crf_search.next_trial(rows, policy(), search)
+            if crf is None:
+                break
+            self.assertIsNone(summary)
+            self.assertNotIn(crf, [row["crf"] for row in rows])
+            rows.append(crf_search.summarize_trial(crf, [
+                result(1, 1_000_000, {"I": crf + 1.67}),
+            ], policy()))
+        else:
+            self.fail("Incremental search did not finish within its trial limit")
+        self.assertEqual(summary["recommended_crf"], 17.8)
+        self.assertEqual(summary["reason"], "precision_reached")
+        self.assertIn(17.8, [row["crf"] for row in rows if row["qp_pass"]])
+
+
+class RuntimePlanningTests(unittest.TestCase):
+    def test_sample_floor_respects_lookahead_and_requested_duration(self):
+        config = crf_search.load_config()
+        config["sampling"]["seconds"] = 6.0
+        info = {"fps": "24", "duration": 120.0}
+        self.assertEqual(crf_search.sample_floor(info, config, ["x264", "x265"]), 3.0)
+        config["codecs"]["x265"]["params"]["rc-lookahead"] = "120"
+        self.assertAlmostEqual(crf_search.sample_floor(info, config, ["x264", "x265"]), 131 / 24)
+        config["sampling"]["seconds"] = 2.0
+        self.assertEqual(crf_search.sample_floor(info, config, ["x264", "x265"]), 2.0)
+
+    def test_duration_calibration_uses_cost_of_both_codecs(self):
+        timings = [{"duration": 3.0, "wall_seconds": 3.0},
+                   {"duration": 3.0, "wall_seconds": 6.0}]
+        combined = crf_search.choose_sample_seconds(6, 3, timings, 10, 3, 450)
+        single = crf_search.choose_sample_seconds(6, 3, timings[:1], 10, 3, 450)
+        self.assertAlmostEqual(combined, 4.0)
+        self.assertEqual(single, 6.0)
+
+    def test_calibration_keeps_floor_when_target_is_too_small(self):
+        seconds = crf_search.choose_sample_seconds(
+            6, 3, [{"duration": 3.0, "wall_seconds": 30.0}], 10, 3, 1,
+        )
+        self.assertEqual(seconds, 3.0)
+
+    def test_expired_timeout_cannot_return_an_existing_cached_sample(self):
+        job = {"input": "fixture.mkv", "codec": "x264", "crf": 18.0,
+               "start": 0.0, "duration": 1.0, "video_index": 0,
+               "settings": {}, "crop": None}
+        source = {"path": "fixture.mkv", "size": 1, "mtime_ns": 1}
+        versions = {"pyav": "test"}
+        encoded = {"frames": 12, "duration": 1.0, "video_bytes": 1000, "qp": {"I": 15}}
+        with (tempfile.TemporaryDirectory(prefix="crf-expired-cache-") as directory,
+              mock.patch.object(crf_search, "run_process", return_value=json.dumps(encoded)) as worker):
+            output = Path(directory)
+            first = crf_search.run_sample(job, source, versions, output, True, timeout=10)
+            self.assertFalse(first["cached"])
+            cached = crf_search.run_sample(job, source, versions, output, True, timeout=10)
+            self.assertTrue(cached["cached"])
+            for expired in (0.0, -1.0):
+                with self.subTest(timeout=expired), self.assertRaises(crf_search.BudgetExpired):
+                    crf_search.run_sample(job, source, versions, output, True, timeout=expired)
+            worker.assert_called_once()
+
 
 class SweepArgumentTests(unittest.TestCase):
     def test_fractional_range_includes_exact_endpoint(self):
@@ -291,6 +356,7 @@ class CropResolutionTests(unittest.TestCase):
     def test_manual_and_disabled_crop_do_not_run_detection(self):
         for requested, expected, dimensions in (
             ("96:64:16:16", "96:64:16:16", (96, 64)),
+            ("110:80:9:7", "110:80:9:7", (110, 80)),
             (None, None, (128, 96)),
         ):
             with self.subTest(crop=requested):
@@ -303,6 +369,16 @@ class CropResolutionTests(unittest.TestCase):
                 detector.assert_not_called()
                 self.assertEqual(resolved["crop"], expected)
                 self.assertEqual((resolved["width"], resolved["height"]), dimensions)
+
+    def test_manual_crop_requires_even_size_but_does_not_change_it(self):
+        for requested in ("95:64:16:16", "96:63:16:16"):
+            with self.subTest(crop=requested):
+                config = crf_search.load_config()
+                config["video"]["crop"] = requested
+                with self.assertRaisesRegex(ValueError, "even"):
+                    crf_search.resolve_crop(
+                        Path("unused.mkv"), {"width": 128, "height": 96}, config, [],
+                    )
 
     def test_automatic_resolution_uses_detected_rectangle(self):
         config = crf_search.load_config()
@@ -358,6 +434,30 @@ class PyAVIntegrationTests(unittest.TestCase):
             "--crf-values", "16,23", *extra,
         ], cwd=ROOT, text=True, capture_output=True, timeout=60)
 
+    def runtime_config(self, name, *, seconds, count):
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        config["sampling"].update(seconds=seconds, count=count)
+        path = self.directory / f"{name}-config.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    def mocked_probe(self, duration):
+        def probe(operation, *_args, **kwargs):
+            self.assertGreater(kwargs["timeout"], 0)
+            if operation == "inspect":
+                return {"width": 96, "height": 64, "duration": duration, "fps": "12"}
+            self.assertEqual(operation, "crop")
+            return {"mode": "auto", "crop": None, "width": 96, "height": 64,
+                    "reason": "Full frame fixture"}
+        return probe
+
+    @staticmethod
+    def mocked_sample(job):
+        return {"duration": job["duration"], "video_bytes": 12_345,
+                "frames": max(1, round(job["duration"] * 12)), "qp": {"I": 15},
+                "width": 96, "height": 64, "cached": False, "cache_key": "mock",
+                "wall_seconds": 1.0, "encoder_options": {}}
+
     def test_both_codecs_sweep_reports_settings_and_resumes_without_encoding(self):
         output = self.directory / "both-codecs"
         completed = self.cli(self.source, output, "--codec", "both")
@@ -394,7 +494,7 @@ class PyAVIntegrationTests(unittest.TestCase):
         self.assertEqual({row["codec"] for row in table}, {"x264", "x265"})
         log_times = {path: path.stat().st_mtime_ns for path in (output / "logs").glob("*.log")}
         self.assertEqual(len(log_times), 4)
-        with (mock.patch.object(crf_search.subprocess, "Popen",
+        with (mock.patch.object(crf_search, "run_process",
                                 side_effect=AssertionError("Cached samples must not start workers")),
               mock.patch.object(crf_search.CONSOLE, "quiet", True)):
             self.assertEqual(crf_search.main([
@@ -426,14 +526,14 @@ class PyAVIntegrationTests(unittest.TestCase):
 
     def test_automatic_crop_is_detected_once_and_shared_by_all_trials(self):
         output = self.directory / "auto-cropped"
-        with (mock.patch.object(crf_search, "detect_crop", wraps=crf_search.detect_crop) as detector,
+        with (mock.patch.object(crf_search, "run_probe", wraps=crf_search.run_probe) as probe,
               mock.patch.object(crf_search.CONSOLE, "quiet", True)):
             exit_code = crf_search.main([
                 str(self.bordered), "--config", str(self.config), "--output-dir", str(output),
                 "--codec", "both", "--crf-values", "16,23",
             ])
         self.assertEqual(exit_code, 0)
-        detector.assert_called_once()
+        self.assertEqual(sum(call.args[0] == "crop" for call in probe.call_args_list), 1)
         report = json.loads((output / "results.json").read_text(encoding="utf-8"))
         self.assertEqual(report["state"], "complete")
         self.assertEqual(report["config"]["video"]["crop"], "auto")
@@ -464,6 +564,192 @@ class PyAVIntegrationTests(unittest.TestCase):
         self.assertEqual((updated["width"], updated["height"]), (96, 64))
         self.assertFalse(updated["cached"])
         self.assertNotEqual(original["cache_key"], updated["cache_key"])
+
+    def test_calibration_freezes_one_sample_plan_for_both_codecs(self):
+        config = self.runtime_config("calibration-plan", seconds=6, count=2)
+        output = self.directory / "calibration-plan"
+        jobs = []
+
+        def encode(job, *_args, **kwargs):
+            self.assertGreater(kwargs["timeout"], 0)
+            jobs.append(job)
+            return self.mocked_sample(job)
+
+        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(120)),
+              mock.patch.object(crf_search, "run_sample", side_effect=encode),
+              mock.patch.object(crf_search, "choose_sample_seconds", return_value=4.0) as choose,
+              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
+            exit_code = crf_search.main([
+                str(self.source), "--config", str(config), "--output-dir", str(output),
+                "--codec", "both", "--crf-values", "16",
+            ])
+        self.assertEqual(exit_code, 0)
+        choose.assert_called_once()
+        self.assertEqual([job["codec"] for job in jobs[:2]], ["x264", "x265"])
+        self.assertEqual([job["duration"] for job in jobs[:2]], [3.0, 3.0])
+        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["state"], "complete")
+        self.assertEqual(len(report["sample_plan"]), 2)
+        self.assertTrue(all(sample["duration"] == 4 for sample in report["sample_plan"]))
+        for analysis in report["codecs"].values():
+            self.assertEqual(len(analysis["rows"]), 1)
+            samples = analysis["rows"][0]["samples"]
+            self.assertEqual([sample["sample"] for sample in samples], report["sample_plan"])
+            self.assertEqual([sample["duration"] for sample in samples], [4.0, 4.0])
+
+    def test_rerun_reuses_calibrated_plan_without_pilots_or_recalculation(self):
+        config = self.runtime_config("calibration-resume", seconds=6, count=2)
+        output = self.directory / "calibration-resume"
+        jobs = []
+        argv = [str(self.source), "--config", str(config), "--output-dir", str(output),
+                "--codec", "both", "--crf-values", "16"]
+
+        def encode(job, *_args, **_kwargs):
+            jobs.append(job)
+            return self.mocked_sample(job)
+
+        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(120)),
+              mock.patch.object(crf_search, "run_sample", side_effect=encode),
+              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
+            with mock.patch.object(crf_search, "choose_sample_seconds", return_value=4.0) as choose:
+                self.assertEqual(crf_search.main(argv), 0)
+            choose.assert_called_once()
+            self.assertEqual([job["duration"] for job in jobs[:2]], [3.0, 3.0])
+            original = json.loads((output / "results.json").read_text(encoding="utf-8"))
+            jobs.clear()
+            with mock.patch.object(crf_search, "choose_sample_seconds",
+                                   side_effect=AssertionError("A resumed plan must not be recalibrated")):
+                self.assertEqual(crf_search.main(argv), 0)
+        resumed = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(resumed["sample_plan"], original["sample_plan"])
+        self.assertEqual(resumed["sampling_calibration"]["seconds"], 4.0)
+        self.assertEqual(len(jobs), 4)
+        self.assertTrue(all(job["duration"] == 4.0 for job in jobs))
+        self.assertEqual({job["codec"] for job in jobs}, {"x264", "x265"})
+        for analysis in resumed["codecs"].values():
+            self.assertEqual(len(analysis["rows"]), 1)
+            self.assertEqual([sample["sample"] for sample in analysis["rows"][0]["samples"]],
+                             original["sample_plan"])
+
+    def test_each_codec_gets_first_trial_after_target_if_hard_budget_remains(self):
+        config = self.runtime_config("first-trial-reservation", seconds=0.25, count=1)
+        output = self.directory / "first-trial-reservation"
+        clock = [100.0]
+        jobs = []
+        base_probe = self.mocked_probe(1)
+
+        def probe(operation, *args, **kwargs):
+            result = base_probe(operation, *args, **kwargs)
+            if operation == "inspect":
+                clock[0] += 120.0
+            return result
+
+        def encode(job, *_args, **kwargs):
+            self.assertGreater(kwargs["timeout"], 0)
+            jobs.append(job)
+            elapsed = 80.0 if job["codec"] == "x264" else 1.0
+            self.assertLessEqual(elapsed, kwargs["timeout"])
+            if job["codec"] == "x265":
+                self.assertGreater(clock[0] - 100.0, 180.0)
+            clock[0] += elapsed
+            return {**self.mocked_sample(job), "wall_seconds": elapsed}
+
+        with (mock.patch.object(crf_search, "run_probe", side_effect=probe),
+              mock.patch.object(crf_search, "run_sample", side_effect=encode),
+              mock.patch.object(crf_search.time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(crf_search.CONSOLE, "quiet", True)):
+            self.assertEqual(crf_search.main([
+                str(self.source), "--config", str(config), "--output-dir", str(output),
+                "--codec", "both", "--target-seconds", "180", "--max-seconds", "300",
+            ]), 0)
+        self.assertEqual([job["codec"] for job in jobs], ["x264", "x265"])
+        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["state"], "time_limit")
+        self.assertEqual(report["runtime"]["elapsed_seconds"], 201.0)
+        for codec, initial in (("x264", 17.5), ("x265", 18.5)):
+            analysis = report["codecs"][codec]
+            self.assertEqual([row["crf"] for row in analysis["rows"]], [initial])
+            self.assertEqual(analysis["search"]["reason"], "time_limit")
+            self.assertEqual(analysis["search"]["recommended_crf"], initial)
+
+    def test_deadline_discards_partial_trial_and_preserves_both_codec_recommendations(self):
+        config = self.runtime_config("partial-deadline", seconds=0.25, count=2)
+        output = self.directory / "partial-deadline"
+        clock = [100.0]
+        jobs = []
+        display = io.StringIO()
+        console = type(crf_search.CONSOLE)(file=display, width=240, color_system=None)
+
+        def encode(job, *_args, **kwargs):
+            self.assertGreater(kwargs["timeout"], 0)
+            self.assertLessEqual(kwargs["timeout"], 10)
+            jobs.append(job)
+            if len(jobs) == 6:
+                clock[0] += kwargs["timeout"]
+                raise crf_search.BudgetExpired("sample exceeded remaining time")
+            clock[0] += 1.0
+            return self.mocked_sample(job)
+
+        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(1)),
+              mock.patch.object(crf_search, "run_sample", side_effect=encode),
+              mock.patch.object(crf_search.time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(crf_search, "CONSOLE", console)):
+            crf_search.main([
+                str(self.source), "--config", str(config), "--output-dir", str(output),
+                "--codec", "both", "--target-seconds", "8", "--max-seconds", "10",
+            ])
+        self.assertEqual([job["codec"] for job in jobs[:4]], ["x264", "x264", "x265", "x265"])
+        self.assertEqual(len(jobs), 6)
+        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["state"], "time_limit")
+        self.assertEqual(report["config"]["runtime"], {"target_seconds": 8.0, "max_seconds": 10.0})
+        self.assertEqual(set(report["codecs"]), {"x264", "x265"})
+        for codec, initial in (("x264", 17.5), ("x265", 18.5)):
+            analysis = report["codecs"][codec]
+            self.assertEqual([row["crf"] for row in analysis["rows"]], [initial])
+            self.assertEqual(len(analysis["rows"][0]["samples"]), 2)
+            self.assertEqual(analysis["search"]["recommended_crf"], initial)
+            self.assertTrue(analysis["search"]["verified"])
+        with (output / "summary.csv").open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["recommended"] == "True" for row in rows))
+        self.assertIn("Highest tested passing CRF", display.getvalue())
+
+    def test_settings_print_before_first_pilot_and_pilot_timeout_still_writes_report(self):
+        config = self.runtime_config("pilot-deadline", seconds=6, count=2)
+        output = self.directory / "pilot-deadline"
+        clock = [100.0]
+        display = io.StringIO()
+        console = type(crf_search.CONSOLE)(file=display, width=240, color_system=None)
+
+        def encode(job, *_args, **kwargs):
+            printed = display.getvalue()
+            for setting in ("x264", "x265", "ultrafast", "high", "main10", "4.1",
+                            "deblock", "-3,-3", "rc-lookahead"):
+                self.assertIn(setting, printed)
+            self.assertEqual(job["duration"], 3.0)
+            self.assertGreater(kwargs["timeout"], 0)
+            clock[0] += kwargs["timeout"]
+            raise crf_search.BudgetExpired("calibration exceeded remaining time")
+
+        with (mock.patch.object(crf_search, "run_probe", side_effect=self.mocked_probe(120)),
+              mock.patch.object(crf_search, "run_sample", side_effect=encode) as worker,
+              mock.patch.object(crf_search.time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(crf_search, "CONSOLE", console)):
+            crf_search.main([
+                str(self.source), "--config", str(config), "--output-dir", str(output),
+                "--codec", "both", "--target-seconds", "8", "--max-seconds", "10",
+            ])
+        self.assertEqual([call.args[0]["codec"] for call in worker.call_args_list], ["x264", "x265"])
+        report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["state"], "time_limit")
+        for analysis in report["codecs"].values():
+            self.assertEqual(analysis["rows"], [])
+            self.assertIsNone(analysis["search"]["recommended_crf"])
+        with (output / "summary.csv").open(encoding="utf-8", newline="") as handle:
+            self.assertEqual(list(csv.DictReader(handle)), [])
+        self.assertIn("No tested CRF", display.getvalue())
 
 
 if __name__ == "__main__":

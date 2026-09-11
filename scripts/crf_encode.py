@@ -176,7 +176,8 @@ def validate_source_settings(
     ):
         raise EncodingError(
             f"{width}x{height} is incompatible with the chroma subsampling of "
-            f"{capabilities['pixel_format']}; choose an even crop dimension"
+            f"{capabilities['pixel_format']}; choose an explicit crop with even width and height. "
+            "Detected dimensions are not rounded automatically."
         )
     if codec == "x264" and str(settings.get("level")) in {"4.1", "41"}:
         macroblocks = math.ceil(width / 16) * math.ceil(height / 16)
@@ -343,6 +344,11 @@ def _encode_frames(
                         graph.configure()
                     crop_source.push(frame)
                     frame = crop_sink.pull()
+                    if (frame.width, frame.height) != (width, height):
+                        raise EncodingError(
+                            f"Crop filter produced {frame.width}x{frame.height}; "
+                            f"the exact requested crop is {width}x{height}"
+                        )
                 frame = frame.reformat(format=encoder.pix_fmt)
                 ticks = (timestamp - first_time) / encoder.time_base
                 if ticks.denominator != 1:

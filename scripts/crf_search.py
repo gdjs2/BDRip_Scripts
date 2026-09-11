@@ -7,10 +7,11 @@ import csv
 import hashlib
 import json
 import math
-import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
@@ -20,11 +21,13 @@ from rich.table import Table
 if __package__:
     from .crf_config import load_config, parse_time, validate_config
     from .crf_crop import detect_crop
-    from .crf_encode import check_encoder, inspect_video, validate_source_settings
+    from .crf_encode import check_encoder, validate_source_settings
+    from .crf_runtime import BudgetExpired, run_probe, run_process
 else:
     from crf_config import load_config, parse_time, validate_config
     from crf_crop import detect_crop
-    from crf_encode import check_encoder, inspect_video, validate_source_settings
+    from crf_encode import check_encoder, validate_source_settings
+    from crf_runtime import BudgetExpired, run_probe, run_process
 
 
 SCHEMA_VERSION = 1
@@ -76,11 +79,16 @@ def select_samples(duration: float, sampling: dict) -> list[dict]:
     return samples
 
 
-def resolve_crop(source: Path, info: dict, config: dict, samples: list[dict]) -> dict:
+def resolve_crop(source: Path, info: dict, config: dict, samples: list[dict],
+                 *, timeout: float | None = None) -> dict:
     """Resolve automatic/manual settings once, before either codec is tested."""
     video = config["video"]
     crop = video["crop"]
     if crop == "auto":
+        if timeout is not None:
+            return run_probe("crop", {"input": str(source), "video_index": video["stream"],
+                                     "samples": samples, "source": info,
+                                     "settings": video["cropdetect"]}, timeout=timeout)
         return detect_crop(source, video["stream"], samples, info, video["cropdetect"])
     if crop is None:
         return {"mode": "disabled", "crop": None, "width": info["width"],
@@ -88,8 +96,8 @@ def resolve_crop(source: Path, info: dict, config: dict, samples: list[dict]) ->
     width, height, x, y = map(int, crop.split(":"))
     if (min(width, height) <= 0 or min(x, y) < 0
             or x + width > info["width"] or y + height > info["height"]
-            or any(value % 2 for value in (width, height, x, y))):
-        raise ValueError("Manual crop must fit the source and use even dimensions and offsets")
+            or width % 2 or height % 2):
+        raise ValueError("Manual crop must fit the source and use even width and height; offsets may be odd")
     return {"mode": "manual", "crop": crop, "width": width, "height": height,
             "reason": "Explicit crop supplied"}
 
@@ -238,6 +246,82 @@ def fit_relationship(rows: list[dict]) -> dict | None:
             "note": "Descriptive sample fit; predictions are not verified measurements."}
 
 
+def next_trial(rows: list[dict], policy: dict, search: dict) -> tuple[float | None, dict | None]:
+    """Advance deterministic search using completed observations, without encoding.
+
+    Replaying at most a handful of observations lets the caller alternate codecs
+    between trials while retaining the same search and stopping criteria.
+    """
+    class TrialNeeded(Exception):
+        pass
+
+    measured = {row["crf"]: row for row in rows}
+
+    def evaluate(crf: float) -> dict:
+        if crf not in measured:
+            raise TrialNeeded(crf)
+        return measured[crf]
+
+    try:
+        _, summary = auto_search(evaluate, policy, search)
+    except TrialNeeded as exc:
+        return exc.args[0], None
+    return None, summary
+
+
+def sample_floor(info: dict, config: dict, codecs: list[str]) -> float:
+    """Allow several seconds and the configured lookahead before shortening clips."""
+    frames = 0
+    for codec in codecs:
+        params = config["codecs"][codec]["params"]
+        try:
+            frames = max(frames, int(params.get("rc-lookahead", 60))
+                         + int(params.get("bframes", 10)) + 1)
+        except ValueError:
+            # The encoder will diagnose unsupported option values itself.
+            frames = max(frames, 71)
+    return min(config["sampling"]["seconds"], max(3.0, frames / float(Fraction(info["fps"]))))
+
+
+def choose_sample_seconds(maximum: float, minimum: float, timings: list[dict],
+                          sample_count: int, planned_trials: int, available: float) -> float:
+    """Budget three measured points using pilot speed, with a 25% allowance."""
+    rate = sum(item["wall_seconds"] / item["duration"] for item in timings)
+    if rate <= 0:
+        return maximum
+    length = available / (sample_count * planned_trials * rate * 1.25)
+    return max(minimum, min(maximum, math.floor(length * 10) / 10))
+
+
+def show_settings(config: dict, codecs: list[str], crfs: list[float] | None) -> None:
+    """Print resolved user settings before any timing pilot or CRF trial."""
+    CONSOLE.print("Encoding options (fixed throughout calibration and search):")
+    for codec in codecs:
+        settings = config["codecs"][codec]
+        CONSOLE.print(
+            f"{codec}: preset={settings['preset']}, profile={settings['profile']}, "
+            f"level={settings['level'] or 'auto'}, pixel_format={settings['pixel_format']}, "
+            f"tune={settings['tune'] or 'none'}", markup=False)
+        CONSOLE.print(f"  {codec}-params: " + ":".join(
+            f"{key}={value}" for key, value in settings["params"].items()), markup=False)
+        options = {"thread_type": "0", **settings["options"]}
+        CONSOLE.print("  options: " + ", ".join(f"{key}={value}" for key, value in options.items()),
+                      markup=False)
+    search = config["search"]
+    CONSOLE.print("CRFs: " + (", ".join(f"{crf:g}" for crf in crfs) if crfs else
+                  f"automatic {search['min_crf']:g}–{search['max_crf']:g}, "
+                  f"at most {search['max_trials']} trials per codec"))
+    runtime = config["runtime"]
+    CONSOLE.print(f"Time budget for the whole run: target {runtime['target_seconds']:g}s, "
+                  f"maximum {runtime['max_seconds']:g}s (including crop and calibration).")
+
+
+def measured_summary(rows: list[dict], reason: str) -> dict:
+    passing = [row["crf"] for row in rows if row["qp_pass"]]
+    return {"reason": reason, "trials": len(rows),
+            "recommended_crf": max(passing, default=None), "verified": bool(passing)}
+
+
 def write_json(path: Path, data: dict) -> None:
     """Publish complete JSON atomically so interrupted runs keep valid results."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,7 +336,11 @@ def write_json(path: Path, data: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume: bool) -> dict:
+def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume: bool,
+               *, timeout: float | None = None) -> dict:
+    cutoff = None if timeout is None else time.monotonic() + timeout
+    if timeout is not None and timeout <= 0:
+        raise BudgetExpired("No time remains for another encoding sample")
     backend = Path(__file__).with_name("crf_encode.py").resolve()
     fingerprint = {"schema": SCHEMA_VERSION, "source": source_id, "versions": versions,
                    "backend_sha256": hashlib.sha256(backend.read_bytes()).hexdigest(), "job": job}
@@ -270,27 +358,21 @@ def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume:
             pass
     log = output / "logs" / f"{job['codec']}-crf{job['crf']:g}-{key[:12]}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="crf-job-") as temporary:
         request = Path(temporary) / "job.json"
         request.write_text(json.dumps(job), encoding="utf-8")
         with log.open("w", encoding="utf-8") as stderr:
-            process = subprocess.Popen([sys.executable, str(backend), "--job", str(request)],
-                                       stdout=subprocess.PIPE, stderr=stderr, text=True,
-                                       encoding="utf-8")
             try:
-                stdout, _ = process.communicate()
-            except BaseException:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                stdout = run_process([sys.executable, str(backend), "--job", str(request)],
+                                     timeout=None if cutoff is None else cutoff - time.monotonic(),
+                                     stderr=stderr)
+            except BudgetExpired:
                 raise
-    if process.returncode:
-        tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
-        raise RuntimeError(f"{job['codec']} CRF {job['crf']:g} sample at {job['start']:g}s failed. "
-                           f"See {log}\n" + "\n".join(tail))
+            except RuntimeError as exc:
+                tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+                raise RuntimeError(f"{job['codec']} CRF {job['crf']:g} sample at {job['start']:g}s failed. "
+                                   f"See {log}\n" + "\n".join(tail)) from exc
     try:
         result = json.loads(stdout)
         if (result["frames"] <= 0 or result["duration"] <= 0 or result["video_bytes"] <= 0
@@ -298,6 +380,7 @@ def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume:
             raise ValueError("Missing encoded video or QP metrics")
     except (ValueError, KeyError, TypeError) as exc:
         raise RuntimeError(f"Invalid encoder result; see {log}") from exc
+    result["wall_seconds"] = time.monotonic() - started
     write_json(cache, {"fingerprint": fingerprint, "result": result})
     return {**result, "cached": False, "cache_key": key}
 
@@ -361,6 +444,7 @@ def parse_crf_range(value: str) -> list[float]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("--config", type=Path, help="JSON encoder, sampling and search settings")
@@ -371,6 +455,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--samples", type=int)
     parser.add_argument("--sample-seconds", type=float)
+    parser.add_argument("--target-seconds", type=float, help="Whole-run time target (default 180)")
+    parser.add_argument("--max-seconds", type=float, help="Whole-run hard time limit (default 300)")
     parser.add_argument("--start", help="Sampling interval start, seconds or HH:MM:SS")
     parser.add_argument("--end", help="Sampling interval end, seconds or HH:MM:SS")
     parser.add_argument("--stress-start", action="append", help="Additional difficult scene, seconds or HH:MM:SS")
@@ -400,19 +486,34 @@ def main(argv: list[str] | None = None) -> int:
             config["video"]["crop"] = None
         if args.video_stream is not None:
             config["video"]["stream"] = args.video_stream
+        for name in ("target_seconds", "max_seconds"):
+            if getattr(args, name) is not None:
+                config["runtime"][name] = getattr(args, name)
+        if args.max_seconds is not None and args.target_seconds is None:
+            config["runtime"]["target_seconds"] = min(config["runtime"]["target_seconds"],
+                                                       args.max_seconds)
         config = validate_config(config)
         codecs = ["x264", "x265"] if args.codec == "both" else [args.codec]
+        runtime = config["runtime"]
+        # Leave a small reserve to publish reports after native workers stop.
+        deadline = started + runtime["max_seconds"] - min(1.0, runtime["max_seconds"] * 0.05)
+        target = started + runtime["target_seconds"]
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        show_settings(config, codecs, crfs)
         for codec in codecs:
             check_encoder(codec, config["codecs"][codec])
-        info = inspect_video(source, config["video"]["stream"])
-        samples = select_samples(info["duration"], config["sampling"])
-        with CONSOLE.status("Preparing video crop before encoding samples"):
-            crop_detection = resolve_crop(source, info, config, samples)
-        for codec in codecs:
-            validate_source_settings(info, codec, config["codecs"][codec], crop_detection["crop"])
         output = (args.output_dir.expanduser().resolve() if args.output_dir
                   else source.parent / f"{source.stem}.crf-search")
         output.mkdir(parents=True, exist_ok=True)
+        previous_report = None
+        if not args.no_resume and (output / "results.json").is_file():
+            try:
+                previous_report = json.loads((output / "results.json").read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                pass
         import av
         versions = {"pyav": av.__version__,
                     "libraries": {k: list(v) for k, v in av.library_versions.items()}}
@@ -420,68 +521,194 @@ def main(argv: list[str] | None = None) -> int:
         source_id = {"path": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
         report = {"schema_version": SCHEMA_VERSION,
                   "created_utc": datetime.now(timezone.utc).isoformat(), "state": "running",
-                  "source": source_id, "video": info, "versions": versions,
-                  "config": config, "sample_plan": samples, "crop_detection": crop_detection,
-                  "codecs": {},
+                  "source": source_id, "versions": versions, "config": config,
+                  "runtime": {**runtime, "elapsed_seconds": 0.0},
+                  "sample_plan": [], "codecs": {codec: {"rows": [], "search": {},
+                                                        "relationship_fit": None} for codec in codecs},
                   "notes": ["Bitrate is encoded video payload Mbps (decimal), excluding container overhead.",
                             "Movie bitrate is estimated from representative samples; stress samples are excluded.",
                             "QP95 is the interpolated 95th percentile of sample max(I/P/B average QP).",
                             "Each stress sample must also meet the QP safety target.",
-                            "QP is an encoder policy metric, not a guarantee of visual transparency."]}
+                            "QP is an encoder policy metric, not a guarantee of visual transparency.",
+                            "Short clips give preliminary estimates; GOP startup and limited scene coverage affect results."]}
+        write_reports(output, report)
+        info = run_probe("inspect", {"input": str(source), "video_index": config["video"]["stream"]},
+                         timeout=remaining())
+        report["video"] = info
+        minimum = sample_floor(info, config, codecs)
+        samples = select_samples(info["duration"], {**config["sampling"], "seconds": minimum})
+        minimum = samples[0]["duration"]
+        sample_start = config["sampling"]["start"]
+        sample_end = config["sampling"]["end"] or info["duration"]
+        representative_count = sum(sample["kind"] == "representative" for sample in samples)
+        maximum = min(config["sampling"]["seconds"],
+                      (sample_end - sample_start) / representative_count)
+        with CONSOLE.status("Preparing video crop before encoding samples"):
+            crop_detection = resolve_crop(source, info, config, samples, timeout=remaining())
+        report.update(crop_detection=crop_detection, sample_plan=samples)
+        for codec in codecs:
+            validate_source_settings(info, codec, config["codecs"][codec], crop_detection["crop"])
         CONSOLE.print(f"Video: {info['width']}×{info['height']}, {info['duration']:.2f}s; "
                       f"{len(samples)} samples per CRF. Preset and custom options stay fixed.")
         CONSOLE.print(f"Crop ({crop_detection['mode']}): {crop_detection['crop'] or 'full frame'}; "
                       f"encoding {crop_detection['width']}×{crop_detection['height']}. "
                       f"{crop_detection['reason']}")
-        for codec in codecs:
+
+        def make_job(codec: str, crf: float, sample: dict) -> dict:
             policy = config["codecs"][codec]
-            settings = {key: policy[key] for key in ENCODER_KEYS}
-            analysis = {"rows": [], "search": {}, "relationship_fit": None}
-            report["codecs"][codec] = analysis
-            write_reports(output, report)
+            return {"input": str(source), "video_index": config["video"]["stream"],
+                    "start": sample["start"], "duration": sample["duration"],
+                    "codec": codec, "crf": crf, "settings": {key: policy[key] for key in ENCODER_KEYS},
+                    "crop": crop_detection["crop"]}
 
-            def evaluate(crf: float) -> dict:
+        timings = {}
+        length = minimum
+        active = list(codecs)
+        signature = {"source": source_id, "versions": versions, "config": config,
+                     "codecs": codecs, "crop": crop_detection["crop"],
+                     "backend_sha256": hashlib.sha256(Path(__file__).with_name("crf_encode.py").read_bytes()).hexdigest()}
+        saved_plan = (previous_report.get("sampling_calibration", {})
+                      if isinstance(previous_report, dict) else {})
+        saved_length = saved_plan.get("seconds")
+        if (saved_plan.get("signature") == signature
+                and isinstance(saved_length, (int, float)) and minimum <= saved_length <= maximum):
+            length = saved_length
+            timings = saved_plan.get("timings", {})
+            CONSOLE.print(f"Reusing the previous {length:g}s sample plan for cached measurements.")
+        elif maximum > minimum + 1e-6:
+            for codec in codecs:
+                pilot_crf = crfs[0] if crfs else config["codecs"][codec]["initial_crf"]
+                CONSOLE.print(f"Calibrating {codec} speed with a {minimum:g}s clip at CRF {pilot_crf:g}.")
+                try:
+                    # If a single pilot exceeds this share, ten such samples
+                    # cannot fit. Give the other codec a chance to be measured.
+                    timeout = min(remaining(), max(
+                        remaining() / (len(active) * len(samples)),
+                        max(0.0, target - time.monotonic()) / (3 * len(active))))
+                    pilot = run_sample(make_job(codec, pilot_crf, samples[0]), source_id,
+                                       versions, output, not args.no_resume, timeout=timeout)
+                    timings[codec] = {"duration": pilot["duration"],
+                                      "wall_seconds": pilot.get("wall_seconds", timeout)}
+                except BudgetExpired:
+                    report["codecs"][codec]["search"] = measured_summary([], "time_limit")
+                    active.remove(codec)
+                    CONSOLE.print(f"{codec}: timing pilot exceeded its budget; no complete trial measured.")
+            if timings:
+                length = choose_sample_seconds(maximum, minimum, list(timings.values()), len(samples),
+                                               min(3, len(crfs)) if crfs else 3,
+                                               max(0.0, target - time.monotonic()))
+        # Keep the same centers and count used for crop detection. Every CRF
+        # and codec receives this identical plan, including any stress windows.
+        samples = [{**sample,
+                    "start": sample["start"] - (length - sample["duration"]) / 2
+                    if sample["kind"] == "representative" else sample["start"],
+                    "duration": length if sample["kind"] == "representative"
+                    else min(length, info["duration"] - sample["start"])} for sample in samples]
+        report.update(sample_plan=samples, sampling_calibration={"seconds": length, "timings": timings,
+                                                                 "signature": signature})
+        CONSOLE.print(f"Testing {representative_count} representative clips of {length:g}s each "
+                      f"({representative_count * length:g}s of video per CRF), plus "
+                      f"{len(samples) - representative_count} stress clips.")
+        CONSOLE.print("Short-clip results are preliminary estimates; only complete sample sets enter the table.")
+        quota = {codec: remaining() / len(active) for codec in active}
+        trial_times = {}
+
+        def retire(codec: str) -> None:
+            active.remove(codec)
+            # Once a codec has finished, its unused share can help the other
+            # codec finish a full trial; the global deadline still applies.
+            if active:
+                share = max(0.0, quota[codec]) / len(active)
+                for other in active:
+                    quota[other] += share
+            quota[codec] = 0.0
+
+        while active:
+            for codec in list(active):
+                analysis = report["codecs"][codec]
+                rows = analysis["rows"]
+                policy = config["codecs"][codec]
+                if crfs:
+                    measured = {row["crf"] for row in rows}
+                    candidate = next((value for value in crfs if value not in measured), None)
+                    summary = measured_summary(rows, "explicit_sweep") if candidate is None else None
+                else:
+                    candidate, summary = next_trial(rows, policy, config["search"])
+                if summary is not None:
+                    analysis["search"] = summary
+                    retire(codec)
+                    continue
+                estimated = trial_times.get(codec, 0.0)
+                if (remaining() <= 0 or quota[codec] <= 0
+                        or (rows and time.monotonic() >= target)
+                        or (rows and estimated > target - time.monotonic())):
+                    analysis["search"] = measured_summary(rows, "time_limit")
+                    retire(codec)
+                    continue
+                trial_started = time.monotonic()
                 results = []
-                with CONSOLE.status(f"{codec} CRF {crf:g}") as progress:
-                    for index, sample in enumerate(samples):
-                        progress.update(f"{codec} CRF {crf:g}: sample {index + 1}/{len(samples)}")
-                        job = {"input": str(source), "video_index": config["video"]["stream"],
-                               "start": sample["start"], "duration": sample["duration"],
-                               "codec": codec, "crf": crf, "settings": settings,
-                               "crop": crop_detection["crop"]}
-                        result = run_sample(job, source_id, versions, output, not args.no_resume)
-                        results.append({**result, "sample": sample})
-                row = summarize_trial(crf, results, policy)
-                analysis["rows"].append(row)
-                analysis["rows"].sort(key=lambda r: r["crf"])
+                timed_out = False
+                try:
+                    with CONSOLE.status(f"{codec} CRF {candidate:g}") as progress:
+                        for index, sample in enumerate(samples):
+                            progress.update(f"{codec} CRF {candidate:g}: sample {index + 1}/{len(samples)}; "
+                                            f"{remaining():.0f}s remaining")
+                            timeout = min(remaining(), quota[codec] - (time.monotonic() - trial_started))
+                            result = run_sample(make_job(codec, candidate, sample), source_id, versions,
+                                                output, not args.no_resume, timeout=timeout)
+                            results.append({**result, "sample": sample})
+                except BudgetExpired:
+                    analysis["search"] = measured_summary(rows, "time_limit")
+                    analysis["incomplete_trial"] = {"crf": candidate, "completed_samples": len(results),
+                                                    "required_samples": len(samples)}
+                    timed_out = True
+                else:
+                    row = summarize_trial(candidate, results, policy)
+                    rows.append(row)
+                    rows.sort(key=lambda item: item["crf"])
+                    analysis["search"] = measured_summary(rows, "running")
+                    CONSOLE.print(f"{codec} CRF {candidate:g}: {row['bitrate_mbps']:.3f} Mbps, "
+                                  f"QP95 {row['qp95']:.2f} — {row['status']}")
+                elapsed = time.monotonic() - trial_started
+                quota[codec] -= elapsed
+                if timed_out:
+                    retire(codec)
+                trial_times[codec] = elapsed * 1.25
+                report["runtime"]["elapsed_seconds"] = time.monotonic() - started
                 write_reports(output, report)
-                CONSOLE.print(f"{codec} CRF {crf:g}: {row['bitrate_mbps']:.3f} Mbps, "
-                              f"QP95 {row['qp95']:.2f} — {row['status']}")
-                return row
-
-            if crfs:
-                rows = [evaluate(c) for c in crfs]
-                passing = [r["crf"] for r in rows if r["qp_pass"]]
-                summary = {"reason": "explicit_sweep", "trials": len(rows),
-                           "recommended_crf": max(passing, default=None), "verified": bool(passing)}
-            else:
-                rows, summary = auto_search(evaluate, policy, config["search"])
-            analysis.update(rows=rows, search=summary, relationship_fit=fit_relationship(rows))
-            write_reports(output, report)
-            show_table(codec, rows, summary)
         report["state"] = "complete"
+        for codec, analysis in report["codecs"].items():
+            analysis["relationship_fit"] = fit_relationship(analysis["rows"])
+            if analysis["search"]["reason"] == "time_limit":
+                report["state"] = "time_limit"
+            show_table(codec, analysis["rows"], analysis["search"])
+        report["runtime"]["elapsed_seconds"] = time.monotonic() - started
         write_reports(output, report)
+        CONSOLE.print(f"Finished in {report['runtime']['elapsed_seconds']:.1f}s; {report['state']}.")
         CONSOLE.print(f"Reports: {output / 'summary.csv'} and {output / 'results.json'}")
+        return 0
+    except BudgetExpired:
+        if report is not None and output is not None:
+            report["state"] = "time_limit"
+            report["runtime"]["elapsed_seconds"] = time.monotonic() - started
+            for codec, analysis in report["codecs"].items():
+                analysis["search"] = measured_summary(analysis["rows"], "time_limit")
+                analysis["relationship_fit"] = fit_relationship(analysis["rows"])
+                show_table(codec, analysis["rows"], analysis["search"])
+            write_reports(output, report)
+            CONSOLE.print(f"Time limit reached. Completed measurements saved to {output}.")
         return 0
     except KeyboardInterrupt:
         if report is not None and output is not None:
             report["state"] = "interrupted"
+            report["runtime"]["elapsed_seconds"] = time.monotonic() - started
             write_reports(output, report)
         CONSOLE.print("Interrupted. Completed samples are cached; rerun the command to resume.")
         return 130
     except (OSError, ValueError, RuntimeError) as exc:
         if report is not None and output is not None:
             report.update(state="failed", error=str(exc))
+            report["runtime"]["elapsed_seconds"] = time.monotonic() - started
             write_reports(output, report)
         CONSOLE.print(f"Error: {exc}", style="red", markup=False)
         return 1
