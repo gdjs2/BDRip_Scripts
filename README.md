@@ -160,3 +160,60 @@ the other variant's URLs.
 Automatically discovered files whose basename starts with `.` are ignored. This
 includes macOS metadata such as `.DS_Store` and `._movie.mkv`; such files are also
 excluded from generated torrents.
+
+## CRF and video bitrate analysis
+
+`scripts/crf_search.py` encodes repeatable samples through PyAV to measure a
+movie's CRF/bitrate relationship for x264 High 8-bit and x265 Main10. It uses the
+FFmpeg libraries supplied by the PyAV Python wheel; the analyzer requires no
+FFmpeg, FFprobe, or HandBrake executable. An installed PyAV build must provide
+`libx264` and/or `libx265` for the selected codec. Only the selected video stream
+is decoded and encoded.
+
+Copy `crf_search.example.json` to `crf_search.json`, edit the sampling and encoder
+settings, then run:
+
+```powershell
+uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json
+```
+
+The example includes the supplied x264/x265 argument strings. Defaults are
+x264 High@4.1 with `placebo`, and x265 Main10 with automatic level and `slower`.
+Every CRF trial uses the same configured preset, tune, crop, and encoder
+arguments. To obtain a measured table at specific CRFs instead of
+automatically searching for the highest tested passing CRF:
+
+```powershell
+uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec x265 --crf-values 16,17,18,19,20,21,22
+uv run python scripts/crf_search.py "movie.mkv" --config crf_search.json --codec x264 --crf-range 16:22:0.5
+```
+
+Default sampling uses ten evenly distributed 45-second windows, reducing their
+count or duration for short clips. Set `--start` and `--end` to exclude credits
+or other unwanted sections. Add a known difficult scene with repeatable
+`--stress-start HH:MM:SS` arguments. Stress scenes must meet the QP target, but
+are excluded from the estimated movie-average bitrate.
+
+Black-margin detection runs once before encoding, examining up to two seconds
+at the center of each representative and stress sample. It combines the
+detected content bounds into one conservative crop, shared by both codecs and
+every CRF, and displays the crop and resulting dimensions before trials begin.
+The detector uses PyAV decoding and FFmpeg's `bbox` filter through PyAV. Configure its
+luminance threshold and scan duration under `video.cropdetect`. Use
+`--crop 1920:800:0:140` for a manual crop, or `--no-crop` / `--crop none` to retain
+the full frame. If detection finds no usable content bounds, it retains the
+full frame automatically.
+
+The console table and `<movie-stem>.crf-search/summary.csv` show CRF, measured
+sample video Mbps, QP95, worst representative QP, stress QP, and status.
+`results.json` records settings, resolved crop detection, sample measurements,
+the recommendation, and
+a descriptive bitrate fit when at least three CRFs were measured. Video Mbps
+excludes audio and container overhead; it estimates full-movie video bitrate
+from the chosen samples. Completed samples and encoder logs are saved alongside
+the reports, and rerunning the same command reuses matching completed samples.
+Use `--output-dir` to choose another report directory or `--no-resume` to encode
+again. QP thresholds guide selection but do not guarantee visual transparency.
+
+See [the implementation/configuration guide](docs/crf-search.md#implemented-pyav-analyzer)
+for the config schema, parameter replacement rules, and search behavior.

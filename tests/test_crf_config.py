@@ -1,0 +1,169 @@
+"""Regression checks for user encoder arguments and CRF configuration."""
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from scripts.crf_config import (
+    DEFAULT_CONFIG,
+    X264_PARAMS,
+    X265_PARAMS,
+    load_config,
+    parse_time,
+    validate_config,
+)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_example_preserves_requested_encoder_arguments(self):
+        example = Path(__file__).resolve().parents[1] / "crf_search.example.json"
+        config = load_config(example)
+        self.assertEqual(config, load_config())
+        for codec, expected in (("x264", X264_PARAMS), ("x265", X265_PARAMS)):
+            actual = ":".join(f"{key}={value}" for key, value in config["codecs"][codec]["params"].items())
+            self.assertEqual(actual, expected)
+
+    def test_partial_overlay_does_not_mutate_defaults(self):
+        config = validate_config({"sampling": {"count": 3}, "codecs": {"x264": {"preset": "fast"}}})
+        config["codecs"]["x264"]["params"]["bframes"] = "2"
+        self.assertEqual(config["sampling"]["count"], 3)
+        self.assertEqual(config["sampling"]["seconds"], 45.0)
+        self.assertEqual(load_config()["codecs"]["x264"]["params"]["bframes"], "10")
+        self.assertEqual(DEFAULT_CONFIG["codecs"]["x264"]["preset"], "placebo")
+
+    def test_default_profiles_presets_and_auto_crop(self):
+        config = load_config()
+        self.assertEqual(config["video"], {
+            "stream": 0, "crop": "auto", "cropdetect": {"limit": 24 / 255, "seconds": 2.0},
+        })
+        for name, preset, profile, level in (("x264", "placebo", "high", "4.1"),
+                                              ("x265", "slower", "main10", None)):
+            codec = config["codecs"][name]
+            self.assertEqual((codec["preset"], codec["profile"], codec["level"]),
+                             (preset, profile, level))
+
+    def test_auto_manual_and_disabled_crop_are_distinct(self):
+        for crop in ("auto", "1920:800:0:140", None):
+            with self.subTest(crop=crop):
+                config = validate_config({"video": {"crop": crop}})
+                self.assertEqual(config["video"]["crop"], crop)
+                self.assertEqual(config["video"]["cropdetect"]["seconds"], 2.0)
+        config = validate_config({"video": {"cropdetect": {"seconds": 4}}})
+        self.assertEqual(config["video"]["cropdetect"], {"limit": 24 / 255, "seconds": 4.0})
+        config["video"]["cropdetect"]["limit"] = 0.2
+        self.assertEqual(load_config()["video"]["cropdetect"]["limit"], 24 / 255)
+
+    def test_crop_detection_settings_are_validated(self):
+        for field, values in (("limit", (0, -0.1, 1, 24, True, "0.1", float("nan"), float("inf"))),
+                              ("seconds", (0, -1, True, "2", float("nan"), float("inf")))):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        validate_config({"video": {"cropdetect": {field: value}}})
+        for crop in ("none", "AUTO", False, [], {}):
+            with self.subTest(crop=crop), self.assertRaises(ValueError):
+                validate_config({"video": {"crop": crop}})
+        for value in (None, [], {"threshold": 0.1}):
+            with self.subTest(cropdetect=value), self.assertRaises(ValueError):
+                validate_config({"video": {"cropdetect": value}})
+
+    def test_provided_params_replace_all_default_parameters(self):
+        for params in ({}, "", {"bframes": 3}, "bframes=3"):
+            with self.subTest(params=params):
+                config = validate_config({"codecs": {"x264": {"params": params}}})
+                actual = config["codecs"]["x264"]["params"]
+                self.assertEqual(actual, {} if not params else {"bframes": "3"})
+                self.assertEqual(config["codecs"]["x265"]["params"], DEFAULT_CONFIG["codecs"]["x265"]["params"])
+
+    def test_encoder_mapping_values_normalized_for_pyav(self):
+        config = validate_config({"codecs": {"x265": {
+            "params": {"early-skip": True, "rect": False, "aq-strength": 0.9},
+            "options": {"threads": 2},
+        }}})
+        self.assertEqual(config["codecs"]["x265"]["params"], {
+            "early-skip": "1", "rect": "0", "aq-strength": "0.9",
+        })
+        self.assertEqual(config["codecs"]["x265"]["options"], {"threads": "2"})
+
+    def test_timestamp_conversion_and_invalid_values(self):
+        for value, expected in ((0, 0.0), (12.5, 12.5), ("12.5", 12.5),
+                                ("03:04.5", 184.5), ("01:02:03.5", 3723.5)):
+            with self.subTest(value=value):
+                self.assertEqual(parse_time(value), expected)
+        for value in (-1, True, None, float("inf"), float("nan"), "01:60:00",
+                      "00:01:60", "bad", "-2", "nan", "1:2:3:4"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_time(value)
+
+    def test_unknown_keys_are_errors(self):
+        for config in ({"codec": {}}, {"codecs": {"x266": {}}},
+                       {"sampling": {"counts": 5}},
+                       {"codecs": {"x264": {"initial": 18}}}):
+            with self.subTest(config=config):
+                with self.assertRaisesRegex(ValueError, "Unknown config key"):
+                    validate_config(config)
+
+    def test_invalid_policy_and_sampling_are_errors(self):
+        configs = [
+            {"sampling": {"count": True}},
+            {"sampling": {"count": 1.5}},
+            {"sampling": {"seconds": 0}},
+            {"sampling": {"seconds": float("nan")}},
+            {"sampling": {"start": 5, "end": 3}},
+            {"sampling": {"stress_starts": ["00:01", 1]}},
+            {"search": {"min_crf": 24, "max_crf": 23}},
+            {"search": {"max_crf": 52}},
+            {"search": {"precision": 0}},
+            {"search": {"precision": 0.001}},
+            {"search": {"max_trials": 0}},
+            {"search": {"max_trials": 2}},
+            {"codecs": {"x264": {"initial_crf": 30}}},
+            {"codecs": {"x264": {"qp_target": 20}}},
+            {"codecs": {"x264": {"normal_bitrate_mbps": [15, 8]}}},
+            {"codecs": {"x264": {"emergency_bitrate_mbps": 10}}},
+            {"codecs": {"x264": {"pixel_format": "yuv420p10le"}}},
+            {"codecs": {"x265": {"profile": "main"}}},
+            {"video": {"stream": -1}},
+            {"video": {"crop": "1920:800:0:1"}},
+            {"video": {"crop": "iw:ih:0:0"}},
+        ]
+        for config in configs:
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    validate_config(config)
+
+    def test_conflicting_search_or_log_options_are_errors(self):
+        for field in ("params", "options"):
+            for key in ("crf", "crf-max", "crf_max", "qp", "bitrate", "pass", "stats",
+                        "csv", "csv-log-level", "log-level", "global_quality", "x264opts",
+                        "x265-params", "preset", "pix_fmt", "map", "vf", "ss", "output",
+                        "flags", "flags2"):
+                with self.subTest(field=field, key=key):
+                    with self.assertRaises(ValueError):
+                        validate_config({"codecs": {"x264": {field: {key: "1"}}}})
+
+    def test_invalid_parameter_syntax_is_rejected(self):
+        for params in ("bframes", "bframes=2:bframes=3", {"bframes": None},
+                       {"bframes": [3]}, {"bframes": "3:crf=40"}, {"-crf": "18"},
+                       {"aq-strength": float("inf")}):
+            with self.subTest(params=params):
+                with self.assertRaises(ValueError):
+                    validate_config({"codecs": {"x264": {"params": params}}})
+
+    def test_file_loading_rejects_duplicate_keys_and_reports_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text('{"sampling": {"count": 2, "count": 3}}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Duplicate JSON config key"):
+                load_config(config_path)
+            config_path.write_text("{invalid}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "config.json"):
+                load_config(config_path)
+            config_path.write_text(json.dumps({"sampling": {"start": "00:05"}}), encoding="utf-8-sig")
+            self.assertEqual(load_config(config_path)["sampling"]["start"], 5.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
