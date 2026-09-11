@@ -16,6 +16,15 @@ IMAGE_EXTS = {
 THUMB_WIDTH = 300
 
 
+def image_files(folder: Path) -> list[Path]:
+    return sorted(
+        file for file in folder.iterdir()
+        if file.is_file()
+        and not file.name.startswith(".")
+        and file.suffix.lower() in IMAGE_EXTS
+    )
+
+
 def make_thumbnail(image_path: Path):
     with Image.open(image_path) as img:
         width, height = img.size
@@ -47,11 +56,10 @@ def main():
         print("Folder does not exist.")
         return
 
-    for file in sorted(folder.iterdir()):
-        if file.suffix.lower() in IMAGE_EXTS:
-            if file.stem.endswith("_thumb"):
-                continue
-            make_thumbnail(file)
+    for file in image_files(folder):
+        if file.stem.endswith("_thumb"):
+            continue
+        make_thumbnail(file)
 
 
 if __name__ == "__main__":

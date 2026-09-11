@@ -1,1 +1,62 @@
-.venv
+# Python environments, bytecode, and tool caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# Operating-system metadata
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+Thumbs.db
+Desktop.ini
+
+# Release-pipeline working directories
+Artifacts/
+Artifacts5/
+Ripped/
+Logs/
+Streams/
+Screenshots/
+debug_*/
+
+# Generated release metadata and temporary state
+release_pipeline.json
+release_pipeline.log
+*.bbcode.json
+*.bbcode.txt
+*-WiKi.txt
+*.torrent
+*.md5
+*.Info
+*.nfo
+tmp*.json
+
+# Local reference posts may contain tracker or image-account identifiers
+template.txt
+
+# Video and intermediate media
+*.mkv
+*.m2ts
+*.mp4
+*.265
+*.264
+*.hevc
+*.avc
+
+# Local AviSynth jobs commonly contain absolute plugin and media paths
+*.avs

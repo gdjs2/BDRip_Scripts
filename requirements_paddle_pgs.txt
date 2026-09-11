@@ -1,0 +1,6 @@
+paddleocr
+sup2srt
+opencv-python-headless
+Pillow
+numpy
+tqdm

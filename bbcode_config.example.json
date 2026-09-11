@@ -1,0 +1,15 @@
+{
+  "english_name": "Golden Boy 2025 1080p BluRay x265 10bit-WiKi",
+  "chinese_name": "[金童]",
+  "extra_description": "国粤双语 内封中字",
+  "file_path": "path/to/Golden.Boy.2025.1080p.BluRay.x265.10bit-WiKi.mkv",
+  "imdb_id": "tt35498436",
+  "encoder": "WiKi",
+  "source": "1080p Blu-ray AVC TrueHD 5.1",
+  "screenshots_dir": "path/to/Artifacts/Screenshots",
+  "encoder_info_file": "encoder_info.txt",
+  "movie_description_file": "movie_description.txt",
+  "screenshot_url_prefix_env": "TTG_SCREENSHOT_URL_PREFIX",
+  "thumbnail_suffix": "_thumb",
+  "output": "Golden.Boy.2025.1080p.BluRay.x265.10bit-WiKi.bbcode.txt"
+}

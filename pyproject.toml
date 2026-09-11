@@ -10,5 +10,8 @@ dependencies = [
     "loguru>=0.7.3",
     "pillow>=12.3.0",
     "pymediainfo>=7.0.1",
+    "rich>=15.0.0",
+    "sup2srt>=0.1.2",
+    "torf>=4.3.1",
     "tqdm>=4.68.3",
 ]
