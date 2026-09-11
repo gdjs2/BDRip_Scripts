@@ -1,4 +1,4 @@
-"""Measure average B-frame QP and video bitrate at CRFs 14–18 using random movie clips."""
+"""Fit B-frame QP and video bitrate from CRF 13/20 encodes of one centered minute."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import csv
 import hashlib
 import json
 import math
-import random
 import subprocess
 import sys
 import tempfile
@@ -19,57 +18,31 @@ from rich.console import Console
 from rich.table import Table
 
 if __package__:
-    from .crf_config import load_config, parse_time, validate_config
+    from .crf_config import load_config, validate_config
     from .crf_crop import detect_crop
     from .crf_encode import check_encoder, inspect_video, validate_source_settings
     from .crf_plot import write_plot
+    from .crf_progress import Progress, read_json, write_json
+    from .crf_model import CRF_VALUES, METHOD, SAMPLE_SECONDS, fit_models, predict, select_sample
 else:
-    from crf_config import load_config, parse_time, validate_config
+    from crf_config import load_config, validate_config
     from crf_crop import detect_crop
     from crf_encode import check_encoder, inspect_video, validate_source_settings
     from crf_plot import write_plot
+    from crf_progress import Progress, read_json, write_json
+    from crf_model import CRF_VALUES, METHOD, SAMPLE_SECONDS, fit_models, predict, select_sample
 
 
-CRF_VALUES = (14, 15, 16, 17, 18)
 CONSOLE = Console(stderr=True)
 
 
-def select_samples(duration: float, sampling: dict) -> list[dict]:
-    """Draw one uniform random clip inside each equal temporal stratum."""
-    if not math.isfinite(duration) or duration <= 0:
-        raise ValueError("Video duration must be finite and positive")
-    start = parse_time(sampling["start"])
-    end = duration if sampling["end"] is None else parse_time(sampling["end"])
-    count = sampling["count"]
-    minimum, maximum = sampling["min_seconds"], sampling["max_seconds"]
-    if not 0 <= start < end <= duration + 1e-6:
-        raise ValueError("Sampling bounds must satisfy 0 <= start < end <= video duration")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        raise ValueError("Sample count must be a positive integer")
-    if not (math.isfinite(minimum) and math.isfinite(maximum) and 0 < minimum <= maximum):
-        raise ValueError("Sample durations must be finite and satisfy 0 < min_seconds <= max_seconds")
-    end = min(end, duration)
-    bin_seconds = (end - start) / count
-    if bin_seconds + 1e-9 < minimum:
-        raise ValueError(
-            f"The sampling interval cannot fit {count} clips of at least {minimum:g}s. "
-            "Reduce sampling.count or sampling.min_seconds, or extend the interval."
-        )
-    rng = random.Random(sampling["seed"])
-    samples = []
-    for index in range(count):
-        left, right = start + index * bin_seconds, start + (index + 1) * bin_seconds
-        length = rng.uniform(min(minimum, bin_seconds), min(maximum, bin_seconds))
-        position = rng.uniform(left, max(left, right - length))
-        samples.append({"kind": "representative", "start": position, "duration": length})
-    return samples
-
-
-def resolve_crop(source: Path, info: dict, config: dict, samples: list[dict]) -> dict:
+def resolve_crop(source: Path, info: dict, config: dict, samples: list[dict],
+                 progress: Progress | None = None) -> dict:
     video = config["video"]
     crop = video["crop"]
     if crop == "auto":
-        return detect_crop(source, video["stream"], samples, info, video["cropdetect"])
+        return detect_crop(source, video["stream"], samples, info, video["cropdetect"],
+                           check_cancelled=progress.check_cancelled if progress else None)
     if crop is None:
         return {"mode": "disabled", "crop": None, "width": info["width"],
                 "height": info["height"], "reason": "Automatic cropping disabled"}
@@ -124,20 +97,8 @@ def summarize_trial(crf: int, results: list[dict]) -> dict:
     }
 
 
-def write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                     prefix=".crf-", suffix=".json", delete=False) as handle:
-        temporary = Path(handle.name)
-        json.dump(data, handle, indent=2, ensure_ascii=False, allow_nan=False)
-        handle.write("\n")
-    try:
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume: bool) -> dict:
+def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume: bool,
+               progress: Progress | None = None) -> dict:
     """Isolate native encoder logs, cache complete metrics, and reap on cancellation."""
     backend = Path(__file__).with_name("crf_encode.py").resolve()
     fingerprint = {"schema": 1, "source": source_id, "versions": versions,
@@ -153,15 +114,35 @@ def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume:
         except (ValueError, KeyError, TypeError):
             pass
     log = output / "logs" / f"{job['codec']}-crf{job['crf']:g}-{key[:12]}.log"
+    if log.exists():
+        log = log.with_stem(f"{log.stem}-retry-{time.time_ns()}")
     log.parent.mkdir(parents=True, exist_ok=True)
+    worker_job = dict(job)
+    if progress and progress.enabled:
+        progress.update(log_path=str(log))
+        if progress.sample_path:
+            progress.sample_path.unlink(missing_ok=True)
+            worker_job["progress_file"] = str(progress.sample_path)
     with tempfile.TemporaryDirectory(prefix="crf-job-") as temporary:
         request = Path(temporary) / "job.json"
-        request.write_text(json.dumps(job), encoding="utf-8")
+        request.write_text(json.dumps(worker_job), encoding="utf-8")
         with log.open("w", encoding="utf-8") as stderr:
             process = subprocess.Popen([sys.executable, str(backend), "--job", str(request)],
                                        stdout=subprocess.PIPE, stderr=stderr, text=True, encoding="utf-8")
             try:
-                stdout, _ = process.communicate()
+                if progress and progress.enabled:
+                    progress.update(encoder_pid=process.pid)
+                while True:
+                    if progress and progress.enabled:
+                        progress.check_cancelled()
+                    try:
+                        stdout, _ = process.communicate(timeout=0.25 if progress and progress.enabled else None)
+                        break
+                    except subprocess.TimeoutExpired:
+                        sample_progress = read_json(progress.sample_path) if progress.sample_path else {}
+                        progress.update(sample_fraction=sample_progress.get("fraction", 0.0),
+                                        frames=sample_progress.get("frames", 0),
+                                        flushing=sample_progress.get("flushing", False))
             except BaseException:
                 process.kill()
                 process.communicate()
@@ -180,6 +161,8 @@ def run_sample(job: dict, source_id: dict, versions: dict, output: Path, resume:
 
 
 def write_reports(output: Path, report: dict) -> None:
+    for analysis in report["codecs"].values():
+        analysis["models"] = fit_models(analysis["rows"])
     write_json(output / "results.json", report)
     fields = ["codec", "crf", "average_qp", "average_bitrate_mbps", "sample_count",
               "frames", "b_frames", "duration_seconds", "video_bytes"]
@@ -189,11 +172,20 @@ def write_reports(output: Path, report: dict) -> None:
         for codec, analysis in report["codecs"].items():
             for row in analysis["rows"]:
                 writer.writerow({"codec": codec, **row})
+    with (output / "estimates.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["codec", "crf", "estimated_b_frame_qp", "estimated_bitrate_mbps"])
+        writer.writeheader()
+        for codec, analysis in report["codecs"].items():
+            if analysis["models"]["log_bitrate"]:
+                for crf in range(CRF_VALUES[0], CRF_VALUES[1] + 1):
+                    estimate = predict(analysis["models"], crf)
+                    writer.writerow({"codec": codec, "crf": crf, "estimated_b_frame_qp": estimate["average_qp"],
+                                     "estimated_bitrate_mbps": estimate["average_bitrate_mbps"]})
     write_plot(output, report)
 
 
 def show_settings(config: dict, codecs: list[str]) -> None:
-    CONSOLE.print("CRF sweep: 14, 15, 16, 17, 18. Encoding options:")
+    CONSOLE.print("One centered 60-second sample; measured CRFs: 13 and 20. Encoding options:")
     for codec in codecs:
         settings = config["codecs"][codec]
         CONSOLE.print(f"{codec}: preset={settings['preset']}, profile={settings['profile']}, "
@@ -215,43 +207,51 @@ def show_table(report: dict) -> None:
             table.add_row(codec, str(row["crf"]), qp,
                           f"{row['average_bitrate_mbps']:.3f}", str(row["sample_count"]))
     CONSOLE.print(table)
+    for codec, analysis in report["codecs"].items():
+        qp, bitrate = analysis["models"]["qp"], analysis["models"]["log_bitrate"]
+        if qp:
+            CONSOLE.print(f"{codec}: QP(c) = {qp['a']:.6g} {qp['b']:+.6g} * c")
+        else:
+            CONSOLE.print(f"{codec}: {analysis['models']['qp_status']}")
+        if bitrate:
+            CONSOLE.print(f"{codec}: ln R(c) = {bitrate['d']:.6g} {bitrate['e']:+.6g} * c; R in Mbps")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
-    parser.add_argument("--config", type=Path, help="JSON sampling and encoder settings")
+    parser.add_argument("--config", type=Path, help="JSON video and encoder settings")
     parser.add_argument("--codec", choices=("x264", "x265", "both"), default="both")
-    parser.add_argument("--samples", type=int, help="Number of evenly distributed random clips (default 10)")
-    parser.add_argument("--min-sample-seconds", type=float, help="Minimum random clip length (default 5)")
-    parser.add_argument("--max-sample-seconds", type=float, help="Maximum random clip length (default 10)")
-    parser.add_argument("--sample-seconds", type=float, help="Use this fixed duration for every clip")
-    parser.add_argument("--seed", type=int, help="Random seed for repeatable sample selection (default 0)")
-    parser.add_argument("--start", help="Sampling interval start, seconds or HH:MM:SS")
-    parser.add_argument("--end", help="Sampling interval end, seconds or HH:MM:SS")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--video-stream", type=int)
     crop_options = parser.add_mutually_exclusive_group()
     crop_options.add_argument("--crop", help="auto (default), none, or fixed w:h:x:y")
     crop_options.add_argument("--no-crop", action="store_true")
     parser.add_argument("--no-resume", action="store_true", help="Re-encode matching cached samples")
+    parser.add_argument("--progress-file", type=Path, help="Write atomic JSON progress for a GUI or task runner")
+    parser.add_argument("--cancel-file", type=Path, help="Stop when this cancellation marker exists")
     args = parser.parse_args(argv)
-    if args.sample_seconds is not None and (args.min_sample_seconds is not None or args.max_sample_seconds is not None):
-        parser.error("--sample-seconds cannot be combined with minimum/maximum sample duration options")
+    source_path = args.input.expanduser().resolve()
+    output_path = (args.output_dir.expanduser().resolve() if args.output_dir
+                   else source_path.parent / f"{source_path.stem}.crf-model")
+    protected = {source_path, *(output_path / name for name in (
+        "results.json", "summary.csv", "estimates.csv", "qp-bitrate.png", "qp-bitrate.svg", "config.json"))}
+    if args.config:
+        protected.add(args.config.expanduser().resolve())
+    if args.progress_file:
+        progress_path = args.progress_file.expanduser().resolve()
+        progress_paths = {progress_path, progress_path.with_name("sample-progress.json")}
+        if progress_paths & protected or (args.cancel_file and args.cancel_file.expanduser().resolve() in progress_paths):
+            parser.error("Progress files must be separate from the input, configuration, reports, and cancel marker")
     output = report = None
     started = time.monotonic()
+    tracking = Progress(args.progress_file, args.cancel_file)
     try:
+        tracking.update(stage="inspecting", message="Inspecting video and encoder settings")
         source = args.input.expanduser().resolve()
         if not source.is_file():
             raise ValueError(f"Input movie does not exist: {source}")
         config = load_config(args.config)
-        for argument, field in (("samples", "count"), ("min_sample_seconds", "min_seconds"),
-                                ("max_sample_seconds", "max_seconds"), ("seed", "seed"),
-                                ("start", "start"), ("end", "end")):
-            if getattr(args, argument) is not None:
-                config["sampling"][field] = getattr(args, argument)
-        if args.sample_seconds is not None:
-            config["sampling"].update(min_seconds=args.sample_seconds, max_seconds=args.sample_seconds)
         if args.video_stream is not None:
             config["video"]["stream"] = args.video_stream
         if args.crop is not None:
@@ -264,48 +264,57 @@ def main(argv: list[str] | None = None) -> int:
         for codec in codecs:
             check_encoder(codec, config["codecs"][codec])
         info = inspect_video(source, config["video"]["stream"])
-        samples = select_samples(info["duration"], config["sampling"])
+        sample = select_sample(info["duration"])
+        samples = [sample]
+        tracking.update(stage="cropping", message="Detecting black margins",
+                        total=len(samples) * len(codecs) * len(CRF_VALUES))
         with CONSOLE.status("Detecting black margins"):
-            crop = resolve_crop(source, info, config, samples)
+            crop = resolve_crop(source, info, config, samples, tracking)
         for codec in codecs:
             validate_source_settings(info, codec, config["codecs"][codec], crop["crop"])
         CONSOLE.print(f"Crop: {crop['crop'] or 'full frame'}; encoding {crop['width']}×{crop['height']}.")
-        CONSOLE.print(f"Random seed {config['sampling']['seed']}; {len(samples)} clips, "
-                      f"{sum(sample['duration'] for sample in samples):.2f}s of video per CRF.")
-        for index, sample in enumerate(samples, 1):
-            CONSOLE.print(f"  Clip {index}: start {sample['start']:.3f}s, duration {sample['duration']:.3f}s")
+        CONSOLE.print(f"Centered sample: start {sample['start']:.3f}s, duration {sample['duration']:.3f}s.")
+        if info["duration"] < SAMPLE_SECONDS:
+            CONSOLE.print("The video is shorter than 60 seconds; using the whole video.")
         output = (args.output_dir.expanduser().resolve() if args.output_dir
-                  else source.parent / f"{source.stem}.crf-sweep")
+                  else source.parent / f"{source.stem}.crf-model")
         output.mkdir(parents=True, exist_ok=True)
         import av
         versions = {"pyav": av.__version__, "libraries": {k: list(v) for k, v in av.library_versions.items()}}
         stat = source.stat()
         source_id = {"path": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-        report = {"schema_version": 3, "qp_frame_type": "B", "state": "running",
+        report = {"schema_version": 4, "method": METHOD, "qp_frame_type": "B", "state": "running",
                   "created_utc": datetime.now(timezone.utc).isoformat(),
                   "source": source_id, "video": info, "versions": versions, "config": config,
                   "crf_values": list(CRF_VALUES), "sample_plan": samples, "crop_detection": crop,
                   "codecs": {codec: {"rows": []} for codec in codecs}, "elapsed_seconds": 0.0,
-                  "notes": ["Average QP uses only B-frames, weighted by B-frame counts across all samples.",
-                            "Without B-frames, average_qp is null and the point is omitted from the figure.",
+                  "notes": ["One 60-second sample centered in the video, or the whole video if shorter.",
+                            "Only CRF 13 and 20 are encoded; all other values are model estimates.",
+                            "QP(c) = a + b*c; ln R(c) = d + e*c, with R in Mbps.",
+                            "Average QP uses only B-frames. Missing B-frame QP prevents only the QP fit.",
                             "Average video Mbps is 8 * total encoded video bytes / total presentation seconds / 1e6.",
                             "Audio, subtitles, and container overhead are excluded.",
                             "All codecs and CRFs encode the same sample ranges and crop."]}
+        tracking.update(stage="reporting", message="Preparing figure and reports")
         write_reports(output, report)
-        for crf in CRF_VALUES:
-            for codec in codecs:
-                results = []
-                with CONSOLE.status(f"{codec} CRF {crf}") as progress:
-                    for index, sample in enumerate(samples, 1):
-                        progress.update(f"{codec} CRF {crf}: clip {index}/{len(samples)}")
-                        job = {"input": str(source), "video_index": config["video"]["stream"],
-                               "start": sample["start"], "duration": sample["duration"],
-                               "codec": codec, "crf": crf, "settings": config["codecs"][codec], "crop": crop["crop"]}
-                        result = run_sample(job, source_id, versions, output, not args.no_resume)
-                        results.append({**result, "sample": sample})
-                row = summarize_trial(crf, results)
+        completed_samples = 0
+        for codec in codecs:
+            for crf in CRF_VALUES:
+                with CONSOLE.status(f"{codec} CRF {crf}"):
+                    tracking.update(stage="encoding", codec=codec, crf=crf,
+                                    completed=completed_samples, sample_fraction=0.0,
+                                    frames=0, flushing=False, log_path=None, encoder_pid=None,
+                                    message=f"{codec} · CRF {crf} · centered {sample['duration']:g}s sample")
+                    job = {"input": str(source), "video_index": config["video"]["stream"],
+                           "start": sample["start"], "duration": sample["duration"],
+                           "codec": codec, "crf": crf, "settings": config["codecs"][codec], "crop": crop["crop"]}
+                    result = run_sample(job, source_id, versions, output, not args.no_resume, tracking)
+                    completed_samples += 1
+                    tracking.update(completed=completed_samples, sample_fraction=0.0)
+                row = summarize_trial(crf, [{**result, "sample": sample}])
                 report["codecs"][codec]["rows"].append(row)
                 report["elapsed_seconds"] = time.monotonic() - started
+                tracking.update(stage="reporting", message=f"Saving {codec} CRF {crf} figure and reports")
                 write_reports(output, report)
                 qp = f"{row['average_qp']:.3f}" if row["average_qp"] is not None else "N/A (no B-frames)"
                 CONSOLE.print(f"{codec} CRF {crf}: average B-frame QP {qp}, "
@@ -314,18 +323,22 @@ def main(argv: list[str] | None = None) -> int:
         write_reports(output, report)
         show_table(report)
         CONSOLE.print(f"Saved table and figure: {output}", markup=False)
+        tracking.update(check=False, state="complete", stage="complete", message="Completed",
+                        sample_fraction=0.0)
         return 0
     except KeyboardInterrupt:
         if report is not None:
             report.update(state="interrupted", elapsed_seconds=time.monotonic() - started)
             write_reports(output, report)
         CONSOLE.print("Interrupted. Completed samples are cached; rerun with the same settings to resume.")
+        tracking.update(check=False, state="interrupted", stage="interrupted", message="Cancelled; completed results saved")
         return 130
     except (OSError, ValueError, RuntimeError) as exc:
         if report is not None:
             report.update(state="failed", error=str(exc), elapsed_seconds=time.monotonic() - started)
             write_reports(output, report)
         CONSOLE.print(f"Error: {exc}", style="red", markup=False)
+        tracking.update(check=False, state="failed", stage="failed", message=str(exc))
         return 1
 
 

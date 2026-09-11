@@ -7,14 +7,6 @@
       "seconds": 2.0
     }
   },
-  "sampling": {
-    "count": 10,
-    "min_seconds": 5.0,
-    "max_seconds": 10.0,
-    "seed": 0,
-    "start": 0.0,
-    "end": null
-  },
   "codecs": {
     "x264": {
       "preset": "placebo",

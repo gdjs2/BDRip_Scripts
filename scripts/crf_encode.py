@@ -2,7 +2,7 @@
 
 The encoder never creates an output movie: compressed packet sizes provide the
 video byte count. x264's closing summary and x265's frame CSV provide the
-quantization averages and frame counts used by the CRF sweep.
+quantization averages and frame counts used by the CRF calibration.
 """
 
 from __future__ import annotations
@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any
 
 import av
+
+if __package__:
+    from .crf_progress import FrameProgress
+else:
+    from crf_progress import FrameProgress
 
 
 class EncodingError(RuntimeError):
@@ -325,6 +330,7 @@ def _encode_frames(
             frames = 0
             packet_count = 0
             graph = crop_source = crop_sink = None
+            progress = FrameProgress(job.get("progress_file"))
 
             def submit(frame: Any, timestamp: Fraction, duration: Fraction) -> None:
                 nonlocal first_time, final_time, video_bytes, frames, packet_count
@@ -364,6 +370,7 @@ def _encode_frames(
                     packet_count += 1
                 frames += 1
                 final_time = timestamp + duration
+                progress.update(frames, float(final_time - first_time) / job["duration"])
 
             pending = None
             pending_time: Fraction | None = None
@@ -401,6 +408,7 @@ def _encode_frames(
                 submit(pending, pending_time, last_duration)
             if not frames or first_time is None or final_time is None:
                 raise EncodingError("The requested sample contains no video frames")
+            progress.update(frames, 0.99, flushing=True)
             for packet in encoder.encode(None):
                 video_bytes += packet.size
                 packet_count += 1

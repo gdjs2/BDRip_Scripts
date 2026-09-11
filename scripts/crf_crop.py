@@ -8,6 +8,7 @@ metadata. Their exact union is used without rounding dimensions or offsets.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,7 @@ def _number(value: Any, name: str, *, positive: bool = False) -> float:
 def _windows(
     samples: list[dict[str, Any]], video_duration: float, seconds: float
 ) -> list[dict[str, Any]]:
-    """Center a brief detection window in every representative/stress sample."""
+    """Center a brief detection window in each selected sample."""
     result: dict[tuple[float, float], dict[str, Any]] = {}
     for sample in samples:
         start = _number(sample["start"], "Sample start")
@@ -118,7 +119,8 @@ class _LumaBounds:
 
 
 def _scan_window(
-    container: Any, stream: Any, source: dict[str, Any], window: dict[str, Any], limit: float
+    container: Any, stream: Any, source: dict[str, Any], window: dict[str, Any], limit: float,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], Bounds | None, set[str]]:
     start_time = _stream_start(container, stream)
     first_time = start_time + Fraction(str(window["start"]))
@@ -151,6 +153,8 @@ def _scan_window(
     decoder = container.decode(stream)
     try:
         for frame in decoder:
+            if check_cancelled:
+                check_cancelled()
             if (frame.width, frame.height) != (source["width"], source["height"]):
                 raise EncodingError("The input changes video dimensions during crop detection")
             if frame.pts is None or frame.time_base is None:
@@ -194,6 +198,7 @@ def detect_crop(
     samples: list[dict[str, Any]],
     source: dict[str, Any],
     settings: dict[str, Any],
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Return one conservative crop for every CRF trial, or retain full frame.
 
@@ -233,7 +238,9 @@ def detect_crop(
             with av.open(str(Path(path).expanduser().resolve()), mode="r") as container:
                 stream = _video_stream(container, video_index)
                 for window in windows:
-                    details, content, problems = _scan_window(container, stream, source, window, limit)
+                    if check_cancelled:
+                        check_cancelled()
+                    details, content, problems = _scan_window(container, stream, source, window, limit, check_cancelled)
                     result["windows"].append(details)
                     for key in ("frames", "content_frames", "black_frames", "uncertain_frames"):
                         result[key] += details[key]

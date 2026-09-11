@@ -161,54 +161,61 @@ Automatically discovered files whose basename starts with `.` are ignored. This
 includes macOS metadata such as `.DS_Store` and `._movie.mkv`; such files are also
 excluded from generated torrents.
 
-## CRF sweep and B-frame QP–bitrate figure
+## Two-point CRF calibration and desktop queue
 
-`scripts/crf_search.py` uses PyAV to encode random video clips at **CRF 14,
-15, 16, 17, and 18**, then writes a figure and CSV table relating average B-frame
-QP to average video bitrate. It needs no FFmpeg or HandBrake executable. Matplotlib
-creates PNG and SVG figures.
+The program encodes one **60-second clip centered in the video** at **CRF 13
+and 20** using PyAV. It records average **B-frame QP** and video bitrate for
+each encoder, then fits `QP(c) = a + b*c` and `ln R(c) = d + e*c` (R in Mbps).
+Videos shorter than 60 seconds use their whole video stream.
 
 ```sh
-uv sync
+uv run --extra gui scripts/crf_gui.py --config crf_search.example.json
+```
+
+Use **Encoder options…** to edit the preset, level, tune, parameters, and
+additional FFmpeg options. **Add videos…** creates one task per video;
+**Start queue** processes them in background processes. The GUI shows live
+encoding progress, a shared-CRF plot with both fitted curves, and complete
+logs. Hover over the plot to see the estimated B-frame QP and Mbps for each
+encoder at the mouse’s CRF. QP uses the left y-axis and bitrate the right;
+solid/dashed lines distinguish the metrics. Bitrate follows `R(c) = exp(d + e*c)`.
+Click to pin the CRF and keep its predictions visible; click elsewhere to move
+the pin, or use **Unpin** to resume hovering. The **Estimates** tab calculates
+QP/bitrate at a chosen CRF instantly.
+**Larger preview…** opens the same interactive plot in a resizable viewer with pan and zoom controls.
+
+Each video finishes x264 at both CRFs before x265 starts. The queue supports
+pause, cancel, and retry, and saves each task's reports, figure, settings,
+and logs under `crf-tasks/`. Use `--workspace PATH` for another persistent
+queue folder. Closing the GUI cancels active work and saves waiting tasks.
+
+The CLI needs no GUI dependency or external FFmpeg/HandBrake executable:
+
+```sh
 uv run scripts/crf_search.py "movie.mkv" --config crf_search.example.json
 ```
 
-Defaults are ten clips of 5–10 seconds, with one uniformly random clip in
-each equal section of the movie. A configurable seed makes the selection
-repeatable. All CRFs and both codecs encode the same clips. Configure
-`sampling.count`, `sampling.min_seconds`, `sampling.max_seconds`, and
-`sampling.seed`, or override them for a run:
+The x264 High@4.1/placebo and x265 Main10/auto/slower defaults and supplied
+argument strings are preserved and printed before encoding. Automatic
+black-margin detection keeps exact crop dimensions and offsets. Use
+`--codec x264` or `--codec x265` to select one encoder, `--crop 1920:804:0:137`
+for a manual crop, or `--no-crop` to use the full frame.
 
-```sh
-uv run scripts/crf_search.py "movie.mkv" --config crf_search.example.json \
-  --samples 8 --min-sample-seconds 5 --max-sample-seconds 10 --seed 42
-```
+The default `<movie-stem>.crf-model/` output contains:
 
-Use `--sample-seconds 8` for fixed-length clips, `--start`/`--end` to restrict
-the sampling interval, and `--codec x264` or `--codec x265` for one encoder.
-The existing x264 High@4.1/placebo and x265 Main10/auto/slower defaults and
-custom argument strings are preserved and printed before encoding begins.
-Automatic black-margin detection runs once and keeps exact crop dimensions
-and offsets. `--crop 1920:804:0:137` supplies a manual crop; `--no-crop`
-preserves the full frame.
+- `qp-bitrate.png` and `.svg`: both curves on a shared CRF axis, with separate QP/Mbps scales.
+- `summary.csv`: two actual measurements per codec.
+- `estimates.csv`: fitted estimates at integer CRFs 13–20.
+- `results.json`: sample, crop, encoder settings, measurements, and coefficients.
+- `logs/` and `cache/`: native logs and completed encodes for resuming.
 
-The `<movie-stem>.crf-sweep/` directory contains:
+QP excludes I/P frames; bitrate includes all video frames and excludes audio,
+subtitles, and container overhead. Missing B-frames prevent the QP fit while
+preserving the bitrate model. The two-point curves approximate the selected
+minute; actual full-movie behavior can differ.
 
-- `qp-bitrate.png` and `qp-bitrate.svg`: average B-frame QP on x, average video Mbps on
-  y, separate curves for the codecs, and a CRF label on every point.
-- `summary.csv`: the five measured rows per selected codec.
-- `results.json`: exact sample ranges, settings, crop, and individual metrics.
-- `logs/` and `cache/`: encoder logs and reusable completed measurements.
-
-QP uses only B-frames, weighted by the B-frame count in each clip. Bitrate
-includes all video frames and is weighted by clip duration. Trials without
-B-frames report unavailable QP and are omitted from the figure.
-Only video is measured. The complete five-point sweep replaces the previous
-adaptive optimizer and its time cutoff, so runtime depends on sample count,
-clip length, and encoding speed. Use the updated example config; the old
-search/runtime/QP-policy fields have been removed.
-
-Rerun with the same seed and settings to reuse cached samples, or use
-`--no-resume` to encode them again. `--output-dir` selects another report
-location. See [the sweep guide](docs/crf-search.md) for configuration details
-and average definitions.
+Rerun with the same settings to reuse cached measurements, or use `--no-resume`
+to encode again. `--output-dir PATH` selects another report folder. Previous
+JSON configs can still supply encoder options; their old random sampling
+settings are ignored. See [the calibration and GUI guide](docs/crf-search.md)
+for model definitions, progress reporting, and existing queue migration.

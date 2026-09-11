@@ -27,8 +27,7 @@ class ConfigTests(unittest.TestCase):
     def test_partial_overlay_does_not_mutate_defaults(self):
         config = validate_config({"sampling": {"count": 3}, "codecs": {"x264": {"preset": "fast"}}})
         config["codecs"]["x264"]["params"]["bframes"] = "2"
-        self.assertEqual(config["sampling"]["count"], 3)
-        self.assertEqual(config["sampling"]["min_seconds"], 5.0)
+        self.assertNotIn("sampling", config)
         self.assertEqual(load_config()["codecs"]["x264"]["params"]["bframes"], "10")
         self.assertEqual(DEFAULT_CONFIG["codecs"]["x264"]["preset"], "placebo")
 
@@ -43,28 +42,18 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((codec["preset"], codec["profile"], codec["level"]),
                              (preset, profile, level))
 
-    def test_random_sampling_defaults_and_fixed_duration(self):
-        config = load_config()
-        self.assertEqual(config["sampling"], {
-            "count": 10, "min_seconds": 5.0, "max_seconds": 10.0,
-            "seed": 0, "start": 0.0, "end": None,
-        })
-        self.assertEqual(set(config), {"video", "sampling", "codecs"})
-        fixed = validate_config({"sampling": {"min_seconds": 7, "max_seconds": 7, "seed": 123}})
-        self.assertEqual(fixed["sampling"]["min_seconds"], 7.0)
-        self.assertEqual(fixed["sampling"]["max_seconds"], 7.0)
-        self.assertEqual(fixed["sampling"]["seed"], 123)
+    def test_legacy_sampling_is_ignored_without_changing_encoder_options_or_input(self):
+        legacy = {"sampling": {"count": 10, "min_seconds": 5, "max_seconds": 10,
+                               "seed": 123, "start": 30, "end": 570},
+                  "codecs": {"x264": {"preset": "fast", "params": "bframes=4"}}}
+        before = json.dumps(legacy)
+        config = validate_config(legacy)
+        self.assertEqual(set(config), {"video", "codecs"})
+        self.assertEqual(config["codecs"]["x264"]["preset"], "fast")
+        self.assertEqual(config["codecs"]["x264"]["params"], {"bframes": "4"})
+        self.assertEqual(json.dumps(legacy), before)
 
-    def test_invalid_random_sampling_settings(self):
-        for field in ("min_seconds", "max_seconds"):
-            for value in (0, -1, True, None, "5", float("nan"), float("inf")):
-                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
-                    validate_config({"sampling": {field: value}})
-        for value in (-1, True, 1.5, None, "0"):
-            with self.subTest(seed=value), self.assertRaises(ValueError):
-                validate_config({"sampling": {"seed": value}})
-        with self.assertRaises(ValueError):
-            validate_config({"sampling": {"min_seconds": 11, "max_seconds": 10}})
+    def test_unknown_retired_settings_are_rejected(self):
         for old_setting in ({"runtime": {}}, {"search": {}},
                             {"codecs": {"x264": {"qp_target": 19.5}}}):
             with self.subTest(old_setting=old_setting), self.assertRaisesRegex(ValueError, "Unknown config key"):
@@ -139,10 +128,9 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Unknown config key"):
                     validate_config(config)
 
-    def test_invalid_sampling_and_encoder_settings_are_errors(self):
+    def test_invalid_video_and_encoder_settings_are_errors(self):
         configs = [
-            {"sampling": {"count": True}}, {"sampling": {"count": 1.5}},
-            {"sampling": {"count": 0}}, {"sampling": {"start": 5, "end": 3}},
+            {"sampling": []},
             {"codecs": {"x264": {"pixel_format": "yuv420p10le"}}},
             {"codecs": {"x265": {"profile": "main"}}},
             {"video": {"stream": -1}}, {"video": {"crop": "1920:801:0:1"}},
@@ -180,7 +168,7 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "config.json"):
                 load_config(config_path)
             config_path.write_text(json.dumps({"sampling": {"start": "00:05"}}), encoding="utf-8-sig")
-            self.assertEqual(load_config(config_path)["sampling"]["start"], 5.0)
+            self.assertEqual(load_config(config_path), load_config())
 
 
 if __name__ == "__main__":

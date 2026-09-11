@@ -1,4 +1,4 @@
-"""Validated sampling and encoder settings for the PyAV CRF sweep."""
+"""Validated encoder settings for calibration on one centered minute of video."""
 
 from __future__ import annotations
 
@@ -28,14 +28,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "stream": 0,
         "crop": "auto",
         "cropdetect": {"limit": 24 / 255, "seconds": 2.0},
-    },
-    "sampling": {
-        "count": 10,
-        "min_seconds": 5.0,
-        "max_seconds": 10.0,
-        "seed": 0,
-        "start": 0.0,
-        "end": None,
     },
     "codecs": {
         "x264": {
@@ -193,6 +185,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     Encoder params/options replace those dictionaries entirely when supplied.
     All other objects merge recursively; unknown schema keys are errors.
     """
+    if isinstance(config, dict) and "sampling" in config:
+        # Import encoder settings from prior versions without retaining their
+        # random sampling policy. New exports use only video and codecs.
+        config = copy.deepcopy(config)
+        legacy = config.pop("sampling")
+        allowed = {"count", "min_seconds", "max_seconds", "seed", "start", "end", "seconds"}
+        if not isinstance(legacy, dict) or set(legacy) - allowed:
+            raise ValueError("Unknown config key or invalid legacy sampling object")
     config = _merge(DEFAULT_CONFIG, config)
     video = config["video"]
     video["stream"] = _integer(video["stream"], "video.stream", 0)
@@ -208,19 +208,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if cropdetect["limit"] >= 1:
         raise ValueError("video.cropdetect.limit must be greater than 0 and less than 1")
     cropdetect["seconds"] = _number(cropdetect["seconds"], "video.cropdetect.seconds", positive=True)
-
-    sampling = config["sampling"]
-    sampling["count"] = _integer(sampling["count"], "sampling.count", 1)
-    sampling["seed"] = _integer(sampling["seed"], "sampling.seed", 0)
-    for name in ("min_seconds", "max_seconds"):
-        sampling[name] = _number(sampling[name], f"sampling.{name}", positive=True)
-    if sampling["min_seconds"] > sampling["max_seconds"]:
-        raise ValueError("sampling.min_seconds must not exceed sampling.max_seconds")
-    sampling["start"] = parse_time(sampling["start"])
-    if sampling["end"] is not None:
-        sampling["end"] = parse_time(sampling["end"])
-        if sampling["end"] <= sampling["start"]:
-            raise ValueError("sampling.end must be greater than sampling.start")
 
     for name, codec in config["codecs"].items():
         prefix = f"codecs.{name}"

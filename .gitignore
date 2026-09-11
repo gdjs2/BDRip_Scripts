@@ -59,6 +59,8 @@ template.txt
 *.avc
 *.crf-search/
 *.crf-sweep/
+*.crf-model/
+crf-tasks/
 
 # Local AviSynth jobs commonly contain absolute plugin and media paths
 *.avs
