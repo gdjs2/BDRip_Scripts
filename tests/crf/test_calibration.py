@@ -432,9 +432,11 @@ class CalibrationIntegrationTests(unittest.TestCase):
                 fitted = predict(analysis["models"], row["crf"])
                 self.assertAlmostEqual(fitted["average_qp"], qp)
                 self.assertAlmostEqual(fitted["average_bitrate_mbps"], rate)
-                for axes, expected in zip(figure.axes, (qp, rate)):
+                for column, expected in enumerate((rate, qp)):
                     self.assertAlmostEqual(
-                        axes.collections[codec_index].get_offsets()[row_index, 1],
+                        figure.axes[0]
+                        .collections[codec_index]
+                        .get_offsets()[row_index, column],
                         expected,
                     )
                 for sample in row["samples"]:

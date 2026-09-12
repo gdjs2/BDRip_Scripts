@@ -9,11 +9,13 @@ These two mean endpoints define each encoder's models:
 QP(c)  = a + b*c
 ln R(c) = d + e*c
 R(c)   = exp(d + e*c)       # R in Mbps
+QP(R)  = a + (b/e)*(ln R - d)
 ```
 
 PyAV's bundled FFmpeg libraries handle decoding, exact cropping, and encoding.
 No FFmpeg, FFprobe, HandBrake, or standalone x264/x265 executable is needed.
-Matplotlib draws the two curves. The GUI uses the optional PySide6 dependency.
+Matplotlib plots video bitrate on the x-axis against average B-frame QP on the
+y-axis, with one curve per encoder. The GUI uses the optional PySide6 dependency.
 
 When both codecs are selected, the order is **x264 CRF 13 → x264 CRF 20 →
 x265 CRF 13 → x265 CRF 20**, completing all samples at each CRF before advancing.
@@ -43,6 +45,9 @@ Choose the **Samples** count, **Seconds each**, codec, and crop, optionally edit
 **Encoder options…**, then click
 **Add videos…** and **Start queue**. Each video becomes a separate task with
 its own saved settings and output folder. Later edits affect newly added tasks.
+Settings and the task queue share a compact left sidebar; the selected video's
+chart occupies the taller right pane. Drag the divider to adjust their widths.
+The **Config** menu loads or saves a configuration file.
 
 Encoding, crop detection, and PNG/SVG export run in background Python
 processes. The GUI renders the interactive plot from saved models and stays
@@ -52,28 +57,26 @@ selected, there are **40 encodes**; selecting one codec runs 20. Frame progress 
 during each encode, including a flushing indication while delayed frames are
 being completed. Progress reaches 100% when the task finishes successfully.
 
-The **QP and bitrate curves** tab overlays both curves on **one interactive
-plot with a shared CRF x-axis**:
+The **Bitrate / QP** tab shows one interactive plot:
 
-- Left y-axis and solid lines: average B-frame QP.
-- Right y-axis and dashed lines: video bitrate in Mbps.
+- **X-axis:** video bitrate in Mbps, on a linear scale.
+- **Y-axis:** average B-frame QP, on a linear scale.
 
-Each codec has its own color. Filled markers show the mean B-frame QPs and hollow
-markers show the mean bitrates at CRF 13 and 20. Curves are fitted estimates.
-Bitrate is drawn as **R(c) = exp(d + e*c)** on a linear Mbps scale, with the
-formula evaluated throughout the CRF interval. If the measured bitrates are
-close, the exponential curve can look almost straight over that interval.
+Each codec has its own color and marker shape. The two markers are measured
+pairs of mean bitrate and mean B-frame QP at CRF 13 and 20. The line between
+them evaluates **QP(R) = a + (b/e)*(ln R - d)** continuously. CRF is eliminated
+from the displayed relationship, using the same saved endpoint models.
 
-Move the mouse anywhere inside the plot to show a vertical CRF cursor,
-highlight the corresponding points on each curve, and display a tooltip with
-estimated B-frame QP and bitrate for each encoder. These values come directly
-from the fitted equations at the mouse's CRF, including fractional values.
-They do not snap to the two measured CRFs or launch additional encodes.
-Missing estimates display `N/A`; values outside 13–20 are labeled as
-extrapolation. Moving outside the plot clears an unpinned cursor and tooltip.
+Move the mouse inside the plot to show a vertical bitrate cursor, highlight
+the corresponding point on each encoder's curve, and display its estimated
+B-frame QP. Both codecs are evaluated at the **same bitrate**, which generally
+corresponds to different CRFs. Hover does not snap to measurements or run more
+encodes. Missing estimates display `N/A`. A bitrate outside an encoder's two
+measured endpoint rates is labeled as extrapolation for that encoder.
+Moving outside the plot clears an unpinned cursor and tooltip.
 
-**Left-click inside the plot to pin the CRF.** The cursor, highlighted curve
-points, and predicted QP/bitrate stay visible when you move the mouse away.
+**Left-click inside the plot to pin the bitrate.** The cursor, highlighted curve
+points, and predicted QPs stay visible when you move the mouse away.
 Click another position to move the pin. **Unpin** on the toolbar, or a
 right-click inside the plot, releases it and restores mouse tracking. Pinning
 works in both the main plot and larger preview. It survives resizing, zooming,
@@ -83,29 +86,32 @@ is active control navigation, so turn those tools off before placing a pin.
 
 The toolbar supports **Pan**, rectangular **Zoom**, **Home** to restore the
 full view, and saving a figure. **Larger preview…** opens the same interactive
-plot in a resizable, non-modal window. Mouse estimates follow the correct CRF
+plot in a resizable, non-modal window. Mouse estimates follow the correct bitrate
 when zoomed or resized. An endpoint appears after all its samples finish.
-Each refresh preserves a manually zoomed view for that task. A codec's curves become
+Each refresh preserves a manually zoomed view for that task. A codec's curve becomes
 available after both CRFs finish, so x264's model can be explored while x265
-runs. The GUI also loads existing two-point results without re-encoding them.
+runs. Existing two-point JSON results also open with the new axes without
+re-encoding. Previously saved image files stay unchanged until regenerated.
 
 Older sweep results retain their saved-image preview with **Fit**, **100%**,
 and **− / +** controls; they do not have the two-point models needed for hover
 estimates.
 
-The **Estimates** tab displays the fitted equations and estimated QP/bitrate
-for a chosen CRF. Changing this value performs no encoding. Values outside
-13–20 are explicitly labeled as extrapolation. **Logs** shows the task log
+The **Estimates** tab accepts a bitrate in Mbps and shows each encoder's estimated
+B-frame QP, QP-versus-bitrate equation, and **approximate CRF**. CRF remains a
+model estimate; changing the chart axes does not correct a bias between sampled
+and full-movie encoding. Changing this value performs no encoding. Extrapolation
+is identified separately for each encoder. **Logs** shows the task log
 or individual encoder logs (last 64 KiB in the viewer; full files stay on disk).
 **Task settings** shows the selected task's saved configuration.
 
 | Control | Behavior |
 | --- | --- |
 | Start queue | Run one video at a time, in queue order. |
-| Pause after current | Finish the active video and leave remaining videos queued. |
-| Cancel task | Cancel waiting work or stop the active encoder and save complete measurements. |
-| Retry task | Queue a failed, cancelled, or interrupted task again, reusing its completed encodes. |
-| Remove task | Remove the list entry while retaining its output folder and all files. |
+| Pause | Finish the active video and leave remaining videos queued. |
+| Cancel | Cancel waiting work or stop the active encoder and save complete measurements. |
+| Retry | Queue a failed, cancelled, or interrupted task again, reusing its completed encodes. |
+| Remove | Remove the list entry while retaining its output folder and all files. |
 
 Failed or cancelled tasks do not block later videos. Closing the window pauses
 the queue and requests cancellation of the active task; it remains responsive
@@ -130,7 +136,7 @@ duplicate filenames. For an input at `/movies/Movie/Streams/movie.mkv`:
     summary.csv             # Endpoint means and sample counts
     samples.csv             # Individual sample measurements and ranges
     estimates.csv           # Estimated values at CRFs 13 through 20
-    qp-bitrate.png          # Both curves overlaid with two y-axes
+    qp-bitrate.png          # Bitrate x-axis, average B-frame QP y-axis
     qp-bitrate.svg
     logs/                   # Native encoder logs, including previous attempts
     cache/                  # Completed encodes for resuming
@@ -163,7 +169,7 @@ followed by all sample starts/durations, the mean endpoint table, and fitted equ
 
 | File | Contents |
 | --- | --- |
-| `qp-bitrate.png`, `qp-bitrate.svg` | One shared-CRF plot with QP on the left y-axis and Mbps on the right, including measured points and fitted curves. |
+| `qp-bitrate.png`, `qp-bitrate.svg` | Video bitrate (Mbps) on x and average B-frame QP on y, with measured points and one fitted curve per encoder. |
 | `summary.csv` | Two endpoint rows per codec: mean QP/Mbps, sample counts, completion flag, and totals for frames, B-frames, duration, and video bytes. |
 | `samples.csv` | One row per completed encode: codec, CRF, sample index/range, average B-frame QP, video Mbps, counts, bytes, and cache status. |
 | `estimates.csv` | Model estimates at integer CRFs 13–20, explicitly separate from measurements. |
@@ -251,6 +257,18 @@ The logarithm is natural. For example, if the endpoint bitrates are 16 and
 pass through their two measured endpoints. No model is produced from a single
 completed endpoint.
 
+The displayed QP-versus-bitrate curve eliminates `c` from those equations:
+
+```text
+c(R)  = (ln(R) - d) / e          # Approximate CRF, shown in the Estimates tab
+QP(R) = (a - b*d/e) + (b/e)*ln(R)
+```
+
+Bitrate must be positive. Equal endpoint bitrates provide no unique inverse,
+so the figure retains measured points without inventing a curve or QP estimate.
+Missing B-frame QP at either endpoint also prevents a fitted QP curve. A single
+completed endpoint is shown as a point until the other endpoint finishes.
+
 Audio, subtitles, and container overhead are excluded. Bitrate is measured
 output, not an enforced target rate. The saved model is under each codec's
 `models.qp` (`a`, `b`) and `models.log_bitrate` (`d`, `e`, `bitrate_unit`).
@@ -277,7 +295,8 @@ The High/8-bit and Main10/10-bit profiles are displayed for reference.
 Parameters accept colon-separated `key=value` entries or one entry per line.
 **Save** validates and applies edits to new tasks; **Cancel** discards them.
 **Restore Defaults** fills in the original settings for review before saving.
-**Load config…** and **Save config…** import/export sampling, video, and encoder settings.
+**Config → Load config…** and **Config → Save config…** import/export sampling,
+video, and encoder settings.
 
 In JSON, `codecs.x264` and `codecs.x265` accept `preset`, `tune`, `profile`,
 `level`, `pixel_format`, `params`, and `options`. `params` accepts a colon-separated

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from bdrip.crf.model import METHOD, predict
+from bdrip.crf.model import METHOD, fit_models, predict_bitrate
 
 
 class ModelEstimates(QWidget):
@@ -21,13 +21,13 @@ class ModelEstimates(QWidget):
         self.report = {}
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
-        controls.addWidget(QLabel("Estimate at CRF"))
-        self.crf = QDoubleSpinBox()
-        self.crf.setRange(0, 51)
-        self.crf.setDecimals(1)
-        self.crf.setSingleStep(0.1)
-        self.crf.setValue(16.5)
-        controls.addWidget(self.crf)
+        controls.addWidget(QLabel("Video bitrate (Mbps)"))
+        self.bitrate = QDoubleSpinBox()
+        self.bitrate.setDecimals(6)
+        self.bitrate.setRange(0.000001, 100000)
+        self.bitrate.setSingleStep(0.1)
+        self.bitrate.setValue(8)
+        controls.addWidget(self.bitrate)
         controls.addStretch()
         layout.addLayout(controls)
         self.message = QLabel()
@@ -35,7 +35,7 @@ class ModelEstimates(QWidget):
         layout.addWidget(self.message)
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(
-            ["Encoder", "Estimated B-frame QP", "Estimated video Mbps"]
+            ["Encoder", "Estimated B-frame QP", "Approximate CRF"]
         )
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
@@ -47,7 +47,7 @@ class ModelEstimates(QWidget):
         self.equations.setWordWrap(True)
         layout.addWidget(self.equations)
         layout.addStretch()
-        self.crf.valueChanged.connect(self.refresh)
+        self.bitrate.valueChanged.connect(self.refresh)
         self.refresh()
 
     def set_report(self, report: dict) -> None:
@@ -62,35 +62,40 @@ class ModelEstimates(QWidget):
                 "Previous sweep result. Its original figure and measurements are preserved."
             )
             return
-        crf = self.crf.value()
-        self.message.setText(
-            "Estimates from CRF 13 and 20; no additional encoding is performed."
-            if 13 <= crf <= 20
-            else "Extrapolation beyond the measured CRF 13–20 interval."
-        )
+        bitrate = self.bitrate.value()
         equations = []
+        extrapolated = []
         for codec, analysis in self.report.get("codecs", {}).items():
-            models = analysis.get("models", {})
-            estimate = predict(models, crf)
+            models = analysis.get("models") or fit_models(analysis["rows"])
+            estimate = predict_bitrate(models, bitrate)
+            if estimate["extrapolated"]:
+                extrapolated.append(codec)
             row = self.table.rowCount()
             self.table.insertRow(row)
             values = [
                 codec,
                 *(
                     f"{estimate[field]:.3f}" if estimate[field] is not None else "N/A"
-                    for field in ("average_qp", "average_bitrate_mbps")
+                    for field in ("average_qp", "crf")
                 ),
             ]
             for column, text in enumerate(values):
                 self.table.setItem(row, column, QTableWidgetItem(text))
-            qp, bitrate = models.get("qp"), models.get("log_bitrate")
-            equations.append(
-                f"{codec}: QP(c) = {qp['a']:.6g} {qp['b']:+.6g}c"
-                if qp
-                else f"{codec}: {models.get('qp_status', 'Waiting for both measurements')}"
-            )
-            if bitrate:
+            qp, rate = models.get("qp"), models.get("log_bitrate")
+            if qp and rate and estimate["average_qp"] is not None:
+                beta = qp["b"] / rate["e"]
+                alpha = qp["a"] - beta * rate["d"]
                 equations.append(
-                    f"{codec}: ln R(c) = {bitrate['d']:.6g} {bitrate['e']:+.6g}c (R in Mbps)"
+                    f"{codec}: QP(R) = {alpha:.6g} {beta:+.6g} ln R (R in Mbps)"
                 )
+            else:
+                equations.append(f"{codec}: {estimate['status']}")
+        self.message.setText(
+            "Estimates from the measured endpoints. CRF is approximate; no additional encoding is performed."
+            + (
+                f"\nExtrapolation outside the measured bitrate range: {', '.join(extrapolated)}."
+                if extrapolated
+                else ""
+            )
+        )
         self.equations.setText("\n".join(equations))

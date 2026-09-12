@@ -22,7 +22,7 @@ except ImportError:
     QApplication = None
 
 from bdrip.crf.config import load_config, validate_config
-from bdrip.crf.model import predict
+from bdrip.crf.model import predict, predict_bitrate
 from tests.fixtures.media import make_media
 
 
@@ -370,9 +370,13 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.window.progress_bar.value(), 100)
         self.assertEqual(self.window.models.table.rowCount(), 2)
         report = json.loads((self.queue.output(first) / "results.json").read_text())
-        self.window.models.crf.setValue(16.5)
+        self.window.models.bitrate.setValue(
+            predict(report["codecs"]["x264"]["models"], 16.5)["average_bitrate_mbps"]
+        )
         for index, codec in enumerate(("x264", "x265")):
-            estimated = predict(report["codecs"][codec]["models"], 16.5)
+            estimated = predict_bitrate(
+                report["codecs"][codec]["models"], self.window.models.bitrate.value()
+            )
             self.assertAlmostEqual(
                 float(self.window.models.table.item(index, 1).text()),
                 estimated["average_qp"],
@@ -380,12 +384,23 @@ class QueueTests(unittest.TestCase):
             )
             self.assertAlmostEqual(
                 float(self.window.models.table.item(index, 2).text()),
-                estimated["average_bitrate_mbps"],
+                estimated["crf"],
                 delta=0.0005,
             )
-        self.window.models.crf.setValue(21)
+        self.window.models.bitrate.setValue(
+            max(
+                row["average_bitrate_mbps"]
+                for analysis in report["codecs"].values()
+                for row in analysis["rows"]
+            )
+            * 2
+        )
         self.assertIn("Extrapolation", self.window.models.message.text())
-        self.assertIn("ln R(c)", self.window.models.equations.text())
+        self.assertIn("ln R", self.window.models.equations.text())
+        self.assertEqual(len(self.window.figure.chart.axes), 1)
+        self.assertGreater(
+            self.window.figure.chart.canvas.height(), self.window.height() * 0.6
+        )
 
     def test_cancellation_reaps_encoder_preserves_results_and_retry_reuses_cache(self):
         self.config["sampling"].update(count=2, seconds=0.5)

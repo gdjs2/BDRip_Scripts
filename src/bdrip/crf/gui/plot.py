@@ -1,4 +1,4 @@
-"""Qt canvas with a shared CRF cursor and estimates from the saved models."""
+"""Qt canvas with a bitrate cursor and B-frame QP estimates from saved models."""
 
 import math
 
@@ -6,29 +6,35 @@ from matplotlib.backend_bases import MouseButton
 from matplotlib.backends.backend_qt import NavigationToolbar2QT
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from PySide6.QtCore import QSize
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from bdrip.crf.model import CRF_VALUES, fit_models, predict
+from bdrip.crf.model import fit_models, predict_bitrate
 from bdrip.crf.plot import PALETTE, make_figure
 
-HOVER_HINT = "Move the mouse to estimate B-frame QP and bitrate. Click to pin a CRF; right-click or Unpin to release."
+HOVER_HINT = "Move to estimate QP · Click to pin bitrate · Right-click to release"
 
 
 class InteractivePlot(QWidget):
     def __init__(self):
         super().__init__()
-        self.figure = Figure(figsize=(12, 6), layout="constrained")
+        self.figure = Figure(figsize=(8, 6), layout="constrained")
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, self, coordinates=False)
+        self.toolbar.setIconSize(QSize(16, 16))
+        self.toolbar.setStyleSheet("QToolButton { padding: 4px; }")
         self.toolbar.addSeparator()
         self.unpin_action = self.toolbar.addAction("Unpin")
         self.unpin_action.setToolTip(
-            "Release the selected CRF and resume mouse estimates"
+            "Release the selected bitrate and resume mouse estimates"
         )
         self.unpin_action.setEnabled(False)
         self.unpin_action.triggered.connect(self.unpin)
         self.readout = QLabel(HOVER_HINT)
         self.readout.setWordWrap(True)
+        self.readout.setMinimumHeight(34)
+        self.readout.setMaximumHeight(44)
+        self.readout.setStyleSheet("color: #475569; font-size: 11px; padding: 4px 8px;")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.toolbar)
@@ -38,8 +44,8 @@ class InteractivePlot(QWidget):
         self.axes = ()
         self.artists = []
         self.background = None
-        self.hover_crf = None
-        self.pinned_crf = None
+        self.hover_bitrate = None
+        self.pinned_bitrate = None
         self.estimates = {}
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
         self.canvas.mpl_connect("button_press_event", self.on_click)
@@ -53,8 +59,8 @@ class InteractivePlot(QWidget):
         limits = [axes.get_xlim() + axes.get_ylim() for axes in self.axes]
         zoomed = bool(self.axes and getattr(self, "default_limits", []) != limits)
         self.background = None
-        self.hover_crf, self.estimates = None, {}
-        make_figure(report, self.figure)
+        self.hover_bitrate, self.estimates = None, {}
+        make_figure(report, self.figure, compact=True)
         self.axes = tuple(self.figure.axes)
         self.models = {
             codec: analysis.get("models") or fit_models(analysis["rows"])
@@ -68,20 +74,20 @@ class InteractivePlot(QWidget):
                 axes.set_xlim(left, right)
                 axes.set_ylim(bottom, top)
             self.toolbar.push_current()
-        qp_axes, bitrate_axes = self.axes
-        self.cursor = bitrate_axes.axvline(
-            13,
+        axes = self.axes[0]
+        self.cursor = axes.axvline(
+            1,
             color="#475569",
             linewidth=1,
             linestyle=":",
             visible=False,
             animated=True,
         )
-        self.tooltip = bitrate_axes.text(
+        self.tooltip = axes.text(
             0.02,
             0.98,
             "",
-            transform=bitrate_axes.transAxes,
+            transform=axes.transAxes,
             va="top",
             fontsize=10,
             visible=False,
@@ -97,33 +103,28 @@ class InteractivePlot(QWidget):
         self.markers = {}
         for codec in self.models:
             color, shape = PALETTE[codec]
-            for axes, metric in (
-                (qp_axes, "average_qp"),
-                (bitrate_axes, "average_bitrate_mbps"),
-            ):
-                (marker,) = axes.plot(
-                    [],
-                    [],
-                    marker=shape,
-                    color=color,
-                    linestyle="none",
-                    markersize=7,
-                    markerfacecolor=color if metric == "average_qp" else "white",
-                    visible=False,
-                    animated=True,
-                )
-                self.markers[codec, metric] = marker
+            (marker,) = axes.plot(
+                [],
+                [],
+                marker=shape,
+                color=color,
+                linestyle="none",
+                markersize=7,
+                visible=False,
+                animated=True,
+            )
+            self.markers[codec] = marker
         self.artists = [self.cursor, *self.markers.values(), self.tooltip]
-        if self.pinned_crf is not None:
-            # Recalculate at the pinned CRF as each encoder finishes, including
+        if self.pinned_bitrate is not None:
+            # Recalculate at the pinned bitrate as each encoder finishes, including
             # a pin placed before both calibration points were available.
-            self.show_estimate(self.pinned_crf)
+            self.show_estimate(self.pinned_bitrate)
         else:
             self.readout.setText(HOVER_HINT)
         self.canvas.draw_idle()
 
     def reset(self) -> None:
-        self.pinned_crf = None
+        self.pinned_bitrate = None
         self.unpin_action.setEnabled(False)
         self.clear_hover()
         self.axes = ()
@@ -157,9 +158,9 @@ class InteractivePlot(QWidget):
         self.canvas.blit(self.figure.bbox)
 
     def clear_hover(self, event=None) -> None:
-        if self.pinned_crf is not None:
+        if self.pinned_bitrate is not None:
             return
-        self.hover_crf, self.estimates = None, {}
+        self.hover_bitrate, self.estimates = None, {}
         for artist in self.artists:
             artist.set_visible(False)
         self.readout.setText(HOVER_HINT)
@@ -167,69 +168,74 @@ class InteractivePlot(QWidget):
             self.paint_hover()
 
     def on_motion(self, event) -> None:
-        if self.pinned_crf is not None:
+        if self.pinned_bitrate is not None:
             return
-        crf = self.event_crf(event)
-        if crf is None:
+        bitrate = self.event_bitrate(event)
+        if bitrate is None:
             self.clear_hover()
         else:
-            self.show_estimate(crf)
+            self.show_estimate(bitrate)
 
-    def event_crf(self, event) -> float | None:
-        crf = event.xdata
+    def event_bitrate(self, event) -> float | None:
+        bitrate = event.xdata
         if (
             event.inaxes not in self.axes
-            or crf is None
-            or not math.isfinite(crf)
-            or not 0 <= crf <= 51
+            or bitrate is None
+            or not math.isfinite(bitrate)
+            or bitrate <= 0
             or self.toolbar.mode
         ):
             return None
-        return crf
+        return bitrate
 
     def on_click(self, event) -> None:
-        crf = self.event_crf(event)
-        if crf is None:
+        bitrate = self.event_bitrate(event)
+        if bitrate is None:
             return
         if event.button == MouseButton.RIGHT:
             self.unpin()
         elif event.button == MouseButton.LEFT:
-            self.pinned_crf = crf
+            self.pinned_bitrate = bitrate
             self.unpin_action.setEnabled(True)
-            self.show_estimate(crf)
+            self.show_estimate(bitrate)
 
     def unpin(self) -> None:
-        self.pinned_crf = None
+        self.pinned_bitrate = None
         self.unpin_action.setEnabled(False)
         self.clear_hover()
 
-    def show_estimate(self, crf: float) -> None:
-        self.hover_crf = crf
+    def show_estimate(self, bitrate: float) -> None:
+        self.hover_bitrate = bitrate
         self.estimates = {
-            codec: predict(model, crf) for codec, model in self.models.items()
+            codec: predict_bitrate(model, bitrate)
+            for codec, model in self.models.items()
         }
-        title = f"{'Pinned CRF' if self.pinned_crf is not None else 'CRF'} {crf:.2f} · estimates"
-        if not CRF_VALUES[0] <= crf <= CRF_VALUES[1]:
-            title += " (extrapolation)"
-        lines = [title]
+        title = f"{'Pinned bitrate' if self.pinned_bitrate is not None else 'Video bitrate'} {bitrate:.3f} Mbps"
+        lines, readout = (
+            [title],
+            [
+                f"{'Pinned · ' if self.pinned_bitrate is not None else ''}{bitrate:.3f} Mbps"
+            ],
+        )
         for codec, estimate in self.estimates.items():
-            qp, rate = estimate["average_qp"], estimate["average_bitrate_mbps"]
+            qp = estimate["average_qp"]
             qp_text = f"{qp:.3f}" if qp is not None else "N/A"
-            rate_text = f"{rate:.4g} Mbps" if rate is not None else "N/A"
-            lines.append(f"{codec}: B-frame QP {qp_text} · bitrate {rate_text}")
-            for metric in ("average_qp", "average_bitrate_mbps"):
-                marker = self.markers[codec, metric]
-                value = estimate[metric]
-                marker.set_visible(value is not None)
-                marker.set_data([crf], [value] if value is not None else [])
-        self.cursor.set_xdata([crf, crf])
-        self.cursor.set_linestyle("-" if self.pinned_crf is not None else ":")
+            suffix = " (extrapolation)" if estimate["extrapolated"] else ""
+            lines.append(f"{codec}: B-frame QP {qp_text}{suffix}")
+            if qp is None:
+                lines.append(estimate["status"])
+            readout.append(f"{codec} QP {qp_text}{suffix}")
+            marker = self.markers[codec]
+            marker.set_visible(qp is not None)
+            marker.set_data([bitrate], [qp] if qp is not None else [])
+        self.cursor.set_xdata([bitrate, bitrate])
+        self.cursor.set_linestyle("-" if self.pinned_bitrate is not None else ":")
         self.cursor.set_visible(True)
         self.tooltip.set_text("\n".join(lines))
         left, right = self.axes[0].get_xlim()
-        on_left = crf >= (left + right) / 2
+        on_left = bitrate >= (left + right) / 2
         self.tooltip.set_position((0.02 if on_left else 0.98, 0.98))
         self.tooltip.set_ha("left" if on_left else "right")
         self.tooltip.set_visible(True)
-        self.readout.setText("   |   ".join(lines))
+        self.readout.setText("   ·   ".join(readout))
         self.paint_hover()

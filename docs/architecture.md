@@ -25,6 +25,7 @@ src/bdrip/
     plot.py               Shared figure construction and PNG/SVG export
     gui/
       app.py              Main window and task controls
+      style.py            Shared desktop colors and compact widget styling
       options.py          Encoder option editor
       estimates.py        Model loading and estimate presentation
       plot.py             Interactive canvas, hover, and pinning

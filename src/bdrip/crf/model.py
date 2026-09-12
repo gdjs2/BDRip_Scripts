@@ -114,3 +114,45 @@ def predict(models: dict, crf: float) -> dict:
         "average_bitrate_mbps": value,
         "extrapolated": not CRF_VALUES[0] <= crf <= CRF_VALUES[1],
     }
+
+
+def predict_bitrate(models: dict, bitrate_mbps: float) -> dict:
+    """Estimate B-frame QP at a video bitrate using the saved two-point fit.
+
+    CRF is retained as an approximate inverse-model result for inspection.
+    Equal endpoint bitrates cannot identify a unique CRF or QP.
+    """
+    if (
+        isinstance(bitrate_mbps, bool)
+        or not math.isfinite(bitrate_mbps)
+        or bitrate_mbps <= 0
+    ):
+        raise ValueError("Prediction bitrate must be finite and positive")
+    result = {
+        "average_bitrate_mbps": bitrate_mbps,
+        "average_qp": None,
+        "crf": None,
+        "extrapolated": False,
+        "status": "Waiting for both bitrate measurements",
+    }
+    rate = models.get("log_bitrate")
+    if not rate:
+        return result
+    if math.isclose(rate["e"], 0, abs_tol=1e-12):
+        result["status"] = "Equal endpoint bitrates; no unique QP estimate"
+        return result
+    crf = (math.log(bitrate_mbps) - rate["d"]) / rate["e"]
+    if not math.isfinite(crf):
+        result["status"] = "Estimate outside the numerical range"
+        return result
+    result.update(
+        crf=crf,
+        extrapolated=not CRF_VALUES[0] - 1e-9 <= crf <= CRF_VALUES[1] + 1e-9,
+        status=models.get("qp_status", "B-frame QP unavailable"),
+    )
+    qp = models.get("qp")
+    if qp:
+        value = qp["a"] + qp["b"] * crf
+        if math.isfinite(value):
+            result.update(average_qp=value, status="ready")
+    return result

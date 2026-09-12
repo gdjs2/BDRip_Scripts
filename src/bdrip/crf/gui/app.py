@@ -17,19 +17,23 @@ try:
         QDialog,
         QDoubleSpinBox,
         QFileDialog,
+        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
         QLabel,
         QLineEdit,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
+        QSizePolicy,
         QSpinBox,
         QSplitter,
         QTabWidget,
+        QToolButton,
         QTreeWidget,
         QTreeWidgetItem,
         QVBoxLayout,
@@ -47,6 +51,7 @@ from bdrip.crf.gui.estimates import ModelEstimates
 from bdrip.crf.gui.options import EncoderSettingsDialog
 from bdrip.crf.gui.preview import FigureDialog, FigurePreview
 from bdrip.crf.gui.queue import Task, TaskQueue
+from bdrip.crf.gui.style import STYLE
 
 
 def elapsed(task: Task) -> str:
@@ -85,8 +90,10 @@ class Window(QMainWindow):
         output_root: Path | None = None,
     ):
         super().__init__()
-        self.setWindowTitle("CRF Video Queue")
-        self.resize(1150, 850)
+        self.setWindowTitle("CRF Studio")
+        self.resize(1080, 760)
+        self.setMinimumSize(880, 620)
+        self.setStyleSheet(STYLE)
         self.config = load_config(config_path)
         self.queue = TaskQueue(workspace, self, output_root=output_root)
         self.closing = False
@@ -97,116 +104,161 @@ class Window(QMainWindow):
         self.figure_dialog: FigureDialog | None = None
 
         central = QWidget()
+        central.setObjectName("workspace")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(18, 14, 18, 14)
-        title = QLabel("CRF Video Queue")
-        title.setStyleSheet("font-size: 22px; font-weight: 600;")
-        layout.addWidget(title)
-        layout.addWidget(
-            QLabel(
-                "Sample means at CRF 13 and 20 · Linear QP and exponential bitrate models"
-            )
-        )
+        layout.setContentsMargins(12, 10, 12, 8)
+        layout.setSpacing(10)
+        header = QHBoxLayout()
+        title = QLabel("CRF Studio")
+        title.setObjectName("heading")
+        header.addWidget(title)
+        subtitle = QLabel("Bitrate & B-frame QP")
+        subtitle.setObjectName("muted")
+        header.addWidget(subtitle)
+        header.addStretch()
+        layout.addLayout(header)
 
-        settings = QGroupBox("Settings for new tasks")
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(12)
+        sidebar = QWidget()
+        sidebar.setMinimumWidth(255)
+        sidebar.setMaximumWidth(400)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(10)
+        settings = QGroupBox("New task settings")
         form = QVBoxLayout(settings)
+        form.setSpacing(8)
         config_row = QHBoxLayout()
         self.config_label = QLabel(
-            str(config_path) if config_path else "Default encoder settings"
+            config_path.name if config_path else "Default configuration"
         )
-        self.config_label.setWordWrap(True)
+        self.config_label.setToolTip(str(config_path) if config_path else "")
+        self.config_label.setObjectName("muted")
+        self.config_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         config_row.addWidget(self.config_label, 1)
-        config_row.addWidget(self.button("Encoder options…", self.edit_encoders))
-        config_row.addWidget(self.button("Load config…", self.load_settings))
-        config_row.addWidget(self.button("Save config…", self.save_settings))
+        config_button = QToolButton()
+        config_button.setText("Config")
+        config_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        config_menu = QMenu(config_button)
+        config_menu.addAction("Load config…", self.load_settings)
+        config_menu.addAction("Save config…", self.save_settings)
+        config_button.setMenu(config_menu)
+        config_row.addWidget(config_button)
         form.addLayout(config_row)
-        values = QHBoxLayout()
-        values.addWidget(QLabel("Samples"))
+        values = QGridLayout()
+        values.setHorizontalSpacing(10)
+        values.addWidget(QLabel("Samples"), 0, 0)
+        values.addWidget(QLabel("Seconds each"), 0, 1)
         self.sample_count = QSpinBox()
         self.sample_count.setRange(1, 10000)
         self.sample_count.setToolTip(
-            "Clips spread across equal sections of the video; short videos use fewer clips"
+            "Clips spread across the video; short videos use fewer clips"
         )
-        values.addWidget(self.sample_count)
-        values.addWidget(QLabel("Seconds each"))
+        values.addWidget(self.sample_count, 1, 0)
         self.sample_seconds = QDoubleSpinBox()
         self.sample_seconds.setDecimals(3)
         self.sample_seconds.setRange(0.001, 86400)
-        values.addWidget(self.sample_seconds)
-        values.addStretch()
-        values.addWidget(QLabel("Codec"))
+        values.addWidget(self.sample_seconds, 1, 1)
+        values.addWidget(QLabel("Codec"), 2, 0)
+        values.addWidget(QLabel("Crop"), 2, 1)
         self.codec = QComboBox()
         self.codec.addItems(["both", "x264", "x265"])
-        values.addWidget(self.codec)
-        values.addWidget(QLabel("Crop"))
+        values.addWidget(self.codec, 3, 0)
         self.crop = QLineEdit()
         self.crop.setToolTip("auto, none, or exact width:height:x:y")
-        values.addWidget(self.crop, 1)
+        values.addWidget(self.crop, 3, 1)
+        values.setColumnStretch(0, 1)
+        values.setColumnStretch(1, 1)
         form.addLayout(values)
+        form.addWidget(self.button("Encoder options…", self.edit_encoders))
         self.encoder_label = QLabel()
+        self.encoder_label.setObjectName("muted")
         self.encoder_label.setWordWrap(True)
         form.addWidget(self.encoder_label)
-        layout.addWidget(settings)
+        side.addWidget(settings)
         self.fill_settings()
 
+        queue_header = QHBoxLayout()
+        queue_header.addWidget(QLabel("Task queue"))
+        queue_header.addStretch()
+        add = self.button("Add videos…", self.add_videos)
+        add.setObjectName("primary")
+        queue_header.addWidget(add)
+        side.addLayout(queue_header)
         controls = QHBoxLayout()
-        controls.addWidget(self.button("Add videos…", self.add_videos))
         self.start_button = self.button("Start queue", self.queue.start)
-        self.pause_button = self.button("Pause after current", self.queue.pause)
-        controls.addWidget(self.start_button)
-        controls.addWidget(self.pause_button)
-        controls.addStretch()
-        self.cancel_button = self.button(
-            "Cancel task", lambda: self.task_action(self.queue.cancel)
-        )
-        self.retry_button = self.button(
-            "Retry task", lambda: self.task_action(self.queue.retry)
-        )
-        self.remove_button = self.button(
-            "Remove task", lambda: self.task_action(self.queue.remove)
-        )
-        self.remove_button.setToolTip(
-            "Remove from the queue list; keep all saved figures and logs"
-        )
-        for button in (self.cancel_button, self.retry_button, self.remove_button):
-            controls.addWidget(button)
-        layout.addLayout(controls)
-
+        self.start_button.setObjectName("primary")
+        self.pause_button = self.button("Pause", self.queue.pause)
+        self.pause_button.setToolTip("Finish the current video, then pause the queue")
+        controls.addWidget(self.start_button, 1)
+        controls.addWidget(self.pause_button, 1)
+        side.addLayout(controls)
         self.overview = QLabel()
-        layout.addWidget(self.overview)
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.overview.setObjectName("muted")
+        side.addWidget(self.overview)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Video", "Codec", "State", "Progress", "Elapsed"])
+        self.tree.setHeaderLabels(["Video / codec", "Status"])
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setMinimumHeight(110)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.tree.setMinimumHeight(95)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, 5):
-            self.tree.header().setSectionResizeMode(
-                column, QHeaderView.ResizeMode.ResizeToContents
-            )
+        self.tree.header().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
         self.tree.itemSelectionChanged.connect(self.refresh_details)
-        splitter.addWidget(self.tree)
+        side.addWidget(self.tree, 1)
+        actions = QHBoxLayout()
+        self.cancel_button = self.button(
+            "Cancel", lambda: self.task_action(self.queue.cancel)
+        )
+        self.retry_button = self.button(
+            "Retry", lambda: self.task_action(self.queue.retry)
+        )
+        self.remove_button = self.button(
+            "Remove", lambda: self.task_action(self.queue.remove)
+        )
+        self.remove_button.setToolTip(
+            "Remove from the queue; keep saved figures and logs"
+        )
+        for button in (self.cancel_button, self.retry_button, self.remove_button):
+            actions.addWidget(button, 1)
+        side.addLayout(actions)
+        self.splitter.addWidget(sidebar)
 
         details = QWidget()
+        details.setMinimumWidth(540)
         detail_layout = QVBoxLayout(details)
-        detail_layout.setContentsMargins(0, 8, 0, 0)
-        self.detail_title = QLabel("Select a task to view its results and logs.")
-        self.detail_title.setWordWrap(True)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(8)
+        self.detail_title = QLabel("Select a video to view its results")
+        self.detail_title.setObjectName("detailTitle")
+        self.detail_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         self.detail_title.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         detail_layout.addWidget(self.detail_title)
         self.progress_label = QLabel()
-        self.progress_label.setWordWrap(True)
+        self.progress_label.setObjectName("muted")
+        self.progress_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         detail_layout.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setTextVisible(False)
         detail_layout.addWidget(self.progress_bar)
-
         self.tabs = QTabWidget()
         self.figure = FigurePreview()
-        self.tabs.addTab(self.figure, "QP and bitrate curves")
+        self.tabs.addTab(self.figure, "Bitrate / QP")
         self.models = ModelEstimates()
         self.tabs.addTab(self.models, "Estimates")
         log_panel = QWidget()
@@ -234,9 +286,11 @@ class Window(QMainWindow):
             links.addWidget(button)
         links.addStretch()
         detail_layout.addLayout(links)
-        splitter.addWidget(details)
-        splitter.setSizes([110, 490])
-        layout.addWidget(splitter, 1)
+        self.splitter.addWidget(details)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([280, 764])
+        layout.addWidget(self.splitter, 1)
         self.statusBar().showMessage(f"Queue folder: {self.queue.workspace}")
         self.queue.changed.connect(self.refresh)
         self.queue.problem.connect(self.show_error)
@@ -258,7 +312,7 @@ class Window(QMainWindow):
 
     def update_encoder_summary(self) -> None:
         self.encoder_label.setText(
-            "  ·  ".join(
+            "\n".join(
                 f"{name}: {settings['profile']} @ {settings['level'] or 'auto'}, {settings['preset']}"
                 for name, settings in self.config["codecs"].items()
             )
@@ -281,6 +335,7 @@ class Window(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config["codecs"] = dialog.config["codecs"]
             self.config_label.setText("Custom encoder settings")
+            self.config_label.setToolTip("")
             self.update_encoder_summary()
         dialog.deleteLater()
 
@@ -296,7 +351,8 @@ class Window(QMainWindow):
             if path:
                 write_json(Path(path), config)
                 self.config = config
-                self.config_label.setText(path)
+                self.config_label.setText(Path(path).name)
+                self.config_label.setToolTip(path)
         except (ValueError, OSError) as exc:
             self.show_error(str(exc))
 
@@ -307,7 +363,8 @@ class Window(QMainWindow):
         if path:
             try:
                 self.config = load_config(Path(path))
-                self.config_label.setText(path)
+                self.config_label.setText(Path(path).name)
+                self.config_label.setToolTip(path)
                 self.fill_settings()
             except ValueError as exc:
                 self.show_error(str(exc))
@@ -358,11 +415,8 @@ class Window(QMainWindow):
             item = self.items[task.id]
             for column, value in enumerate(
                 [
-                    Path(task.video).name,
-                    task.codec,
-                    task.state.title(),
-                    f"{task.percent}%",
-                    elapsed(task),
+                    f"{Path(task.video).name}\n{task.codec.upper()} · {elapsed(task)}",
+                    f"{task.state.title()}\n{task.percent}%",
                 ]
             ):
                 item.setText(column, value)
@@ -383,9 +437,8 @@ class Window(QMainWindow):
             if queued
             else "Queue idle"
         )
-        self.overview.setText(
-            f"{activity}   |   {queued} queued · {completed} completed"
-        )
+        self.overview.setText(f"{queued} queued · {completed} completed")
+        self.overview.setToolTip(activity)
         self.start_button.setEnabled(bool(queued) and not self.queue.enabled)
         self.pause_button.setEnabled(self.queue.enabled)
         if not self.tree.selectedItems() and self.queue.tasks:
@@ -434,11 +487,14 @@ class Window(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(task.percent if task else 0)
         if not task:
-            self.detail_title.setText("Select a task to view its results and logs.")
+            self.detail_title.setText("Select a video to view its results")
+            self.detail_title.setToolTip("")
             self.progress_label.clear()
+            self.progress_label.setToolTip("")
             self.log.clear()
             return
-        self.detail_title.setText(task.video)
+        self.detail_title.setText(Path(task.video).name)
+        self.detail_title.setToolTip(task.video)
         progress = task.progress
         message = task.error or progress.get("message", task.state.title())
         if task.state == "cancelling":
@@ -459,6 +515,7 @@ class Window(QMainWindow):
         self.progress_label.setText(
             f"{message}{counts}{frames}{flushing} · {elapsed(task)}"
         )
+        self.progress_label.setToolTip(self.progress_label.text())
         report_path = self.queue.output(task) / "results.json"
         try:
             stamp = report_path.stat().st_mtime_ns
@@ -524,7 +581,7 @@ class Window(QMainWindow):
             self.figure_dialog.raise_()
 
     def show_error(self, message: str) -> None:
-        QMessageBox.warning(self, "CRF Video Queue", message)
+        QMessageBox.warning(self, "CRF Studio", message)
 
     def closeEvent(self, event) -> None:
         if self.queue.active:
@@ -566,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     app = QApplication([sys.argv[0]])
-    app.setApplicationName("CRF Video Queue")
+    app.setApplicationName("CRF Studio")
     try:
         window = Window(args.workspace, args.config, output_root=args.output_dir)
     except (OSError, ValueError) as exc:
