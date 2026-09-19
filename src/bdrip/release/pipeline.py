@@ -763,7 +763,7 @@ def build_variant(
 
         md5_path = bt_dir / f"{movie_file.stem}.md5"
         md5_path.write_text(
-            f"{movie_file.name} {md5_file(movie_file)}\n", encoding="ascii"
+            f"{md5_file(movie_file)} {movie_file.name}\n", encoding="ascii"
         )
         LOGGER.info("MD5: %s", md5_path)
         next_stage("creating torrent")
